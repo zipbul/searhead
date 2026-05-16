@@ -42,12 +42,6 @@ export const FAILURE_DIMENSIONS = [
   "partially_correct",
 ] as const;
 
-export const CALLBACK_CAPABILITIES = [
-  "always_on",
-  "best_effort",
-  "none",
-] as const;
-
 const claimFeedbackInputSchema = z
   .object({
     // When set, the call updates an existing row instead of inserting
@@ -70,13 +64,6 @@ const claimFeedbackInputSchema = z
     counterClaimText: z.string().max(2000).optional(),
     counterNliScore: z.number().min(0).max(1).optional(),
     auditNote: z.string().max(4000).optional(),
-
-    // Push channel: when reporter is long-lived and reachable, it
-    // can advertise a callback URL + capability. The background
-    // enrichment worker uses these to attempt direct HTTP POST to
-    // the reporter before falling back to awaiting_pull.
-    enrichmentCallbackUrl: z.url().max(2000).optional(),
-    callbackCapability: z.enum(CALLBACK_CAPABILITIES).optional(),
   })
   // Held outcomes can't carry a failure dimension — the claim worked
   // as advertised. Failed/partial may but aren't required to.
@@ -246,8 +233,6 @@ export async function handleClaimFeedback(
       counterClaimText: validated.counterClaimText ?? null,
       counterNliScore: validated.counterNliScore ?? null,
       auditNote: validated.auditNote ?? null,
-      enrichmentCallbackUrl: validated.enrichmentCallbackUrl ?? null,
-      callbackCapability: validated.callbackCapability ?? null,
       enrichmentStatus,
       evidenceStrength,
     });

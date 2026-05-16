@@ -10,14 +10,19 @@
 //      failure_dimension / partial_truth / counter_source_url.
 //   3. Write inferred values into *_inferred columns (never the
 //      direct columns — those belong to the reporter).
-//   4. Optionally push to the reporter's callback URL.
-//   5. Recompute evidence_strength using the new merged view.
-//   6. Transition enrichment_status:
+//   4. Recompute evidence_strength using the new merged view.
+//   5. Transition enrichment_status:
 //        - if direct+inferred now strong enough → finalized_inferred
 //        - else if claim is high-authority → awaiting_pull
 //        - else → finalized_inferred (not worth chasing)
-//   7. Idempotent: re-running on an already-enriched row only
+//   6. Idempotent: re-running on an already-enriched row only
 //      re-evaluates the status transition.
+//
+// No push channel. Real-world reporter agents are almost always
+// transient (LLM tool-call style) with no persistent HTTP server,
+// so the previous push attempt was dead code for the dominant
+// use case. Reporters that want to add detail to their feedback
+// re-call `claim_feedback` in update mode.
 
 import { eq, sql } from "drizzle-orm";
 import { db } from "../db/connection";
@@ -26,7 +31,6 @@ import {
   inferFromAuditNote,
   recomputeEvidenceStrength,
 } from "./enrichment-llm";
-import { pushEnrichmentRequest } from "./push";
 import { logger } from "../observability/logger";
 
 export interface EnrichmentReport {
@@ -35,7 +39,6 @@ export interface EnrichmentReport {
   fieldsInferred: string[];
   finalEnrichmentStatus: string;
   newEvidenceStrength: number;
-  pushOutcome: string | null;
 }
 
 const STRONG_ENOUGH = 0.8;
@@ -62,9 +65,6 @@ export async function runEnrichment(
       counterNliScore: claimFeedback.counterNliScore,
       contextDomain: claimFeedback.contextDomain,
       contextScope: claimFeedback.contextScope,
-      enrichmentCallbackUrl: claimFeedback.enrichmentCallbackUrl,
-      callbackCapability: claimFeedback.callbackCapability,
-      pushAttemptedAt: claimFeedback.pushAttemptedAt,
     })
     .from(claimFeedback)
     .where(eq(claimFeedback.id, feedbackId))
@@ -80,7 +80,6 @@ export async function runEnrichment(
       fieldsInferred: [],
       finalEnrichmentStatus: "not_needed",
       newEvidenceStrength: 0,
-      pushOutcome: null,
     };
   }
 
@@ -141,112 +140,15 @@ export async function runEnrichment(
     partialTruthInferred: inferredPartial,
   });
 
-  // Status transition. First decision: would this otherwise route
-  // to awaiting_pull? If yes AND the reporter advertised a callback,
-  // attempt push first — that may close the loop without waiting
-  // for the reporter to poll on its own cadence.
+  // Status transition. No push channel — outcome is either
+  // finalized_inferred (LLM inference was enough or the claim isn't
+  // worth chasing) or awaiting_pull (claim is worth chasing and
+  // we'll wait for the reporter to re-submit via `claim_feedback`
+  // update mode). The actual transition out of `awaiting_pull`
+  // happens when the reporter calls back, not from here.
   let finalStatus: string;
-  let pushDirectFields:
-    | {
-        failureDimension?: string;
-        partialTruth?: number;
-        counterSourceUrl?: string;
-        counterClaimText?: string;
-        counterNliScore?: number;
-      }
-    | null = null;
-  let pushOutcomeRecord: string | null = null;
-  let pushTimestamp: Date | null = null;
-
-  const wouldRouteToPull =
-    newStrength < STRONG_ENOUGH &&
-    claimAuthority >= PULL_AUTHORITY_FLOOR &&
-    (row.outcome === "failed" || row.outcome === "partial");
-
-  const canPush =
-    wouldRouteToPull &&
-    !row.pushAttemptedAt && // never push twice on the same row
-    row.enrichmentCallbackUrl &&
-    row.callbackCapability &&
-    row.callbackCapability !== "none";
-
-  if (canPush) {
-    pushTimestamp = new Date();
-    const deadline = new Date(
-      pushTimestamp.getTime() +
-        Number(process.env.KNOLDR_FQA_PUSH_DEADLINE_MS ?? 60_000),
-    );
-    const questions: Array<{
-      field: string;
-      prompt: string;
-      enum?: readonly string[];
-      optional?: boolean;
-    }> = [];
-    if (!row.failureDimension && !inferredFailureDim) {
-      questions.push({
-        field: "failureDimension",
-        prompt: "Which dimension of the claim failed?",
-        enum: [
-          "fully_false",
-          "scope_too_broad",
-          "time_expired",
-          "modality_too_strong",
-          "context_mismatch",
-          "partially_correct",
-        ],
-      });
-    }
-    if (!row.counterSourceUrl && !inferredUrl) {
-      questions.push({
-        field: "counterSourceUrl",
-        prompt: "URL or document showing the contradicting evidence?",
-        optional: true,
-      });
-    }
-    const push = await pushEnrichmentRequest(row.enrichmentCallbackUrl!, {
-      enrichmentTaskId: row.id,
-      feedbackId: row.id,
-      claimId: row.claimId,
-      claimText: claimStatement,
-      questions: questions.slice(0, 2),
-      deadline: deadline.toISOString(),
-    });
-    pushOutcomeRecord = push.outcome;
-    if (push.outcome === "success" && push.fields) {
-      pushDirectFields = push.fields;
-    }
-  }
-
-  // Merge direct fields the reporter answered via push (these take
-  // precedence over inferred and respect "original direct wins" —
-  // existing row.* values are preserved if set).
-  const directFailureDim = row.failureDimension ?? pushDirectFields?.failureDimension ?? null;
-  const directPartial = row.partialTruth ?? pushDirectFields?.partialTruth ?? null;
-  const directUrl = row.counterSourceUrl ?? pushDirectFields?.counterSourceUrl ?? null;
-  const directClaimText = row.counterClaimText ?? pushDirectFields?.counterClaimText ?? null;
-  const directNliScore = row.counterNliScore ?? pushDirectFields?.counterNliScore ?? null;
-
-  // Recompute strength again now that push may have filled direct
-  // slots.
-  const finalStrength = pushDirectFields
-    ? recomputeEvidenceStrength({
-        counterSourceUrl: directUrl,
-        counterSourceUrlInferred: inferredUrl,
-        counterNliScore: directNliScore,
-        failureDimension: directFailureDim,
-        failureDimensionInferred: inferredFailureDim,
-        contextDomain: row.contextDomain,
-        contextScope:
-          row.contextScope && typeof row.contextScope === "object"
-            ? (row.contextScope as Record<string, unknown>)
-            : null,
-        partialTruth: directPartial,
-        partialTruthInferred: inferredPartial,
-      })
-    : newStrength;
-
-  if (finalStrength >= STRONG_ENOUGH) {
-    finalStatus = pushDirectFields ? "enriched" : "finalized_inferred";
+  if (newStrength >= STRONG_ENOUGH) {
+    finalStatus = "finalized_inferred";
   } else if (
     claimAuthority >= PULL_AUTHORITY_FLOOR &&
     (row.outcome === "failed" || row.outcome === "partial")
@@ -259,11 +161,6 @@ export async function runEnrichment(
   await db
     .update(claimFeedback)
     .set({
-      failureDimension: directFailureDim,
-      partialTruth: directPartial,
-      counterSourceUrl: directUrl,
-      counterClaimText: directClaimText,
-      counterNliScore: directNliScore,
       failureDimensionInferred: inferredFailureDim,
       partialTruthInferred: inferredPartial,
       counterSourceUrlInferred: inferredUrl,
@@ -274,14 +171,7 @@ export async function runEnrichment(
             enrichmentLlmVersion: llmVersion,
           }
         : {}),
-      ...(pushOutcomeRecord
-        ? {
-            pushOutcome: pushOutcomeRecord,
-            pushAttemptedAt: pushTimestamp,
-            reporterResponded: pushDirectFields ? 1 : 0,
-          }
-        : {}),
-      evidenceStrength: finalStrength,
+      evidenceStrength: newStrength,
       enrichmentStatus: finalStatus,
     })
     .where(eq(claimFeedback.id, row.id));
@@ -292,8 +182,6 @@ export async function runEnrichment(
       claimId: row.claimId,
       fieldsInferred,
       newStrength,
-      finalStrength,
-      pushOutcome: pushOutcomeRecord,
       finalStatus,
       llmVersion,
     },
@@ -302,11 +190,10 @@ export async function runEnrichment(
 
   return {
     feedbackId: row.id,
-    enriched: fieldsInferred.length > 0 || pushDirectFields !== null,
+    enriched: fieldsInferred.length > 0,
     fieldsInferred,
     finalEnrichmentStatus: finalStatus,
-    newEvidenceStrength: finalStrength,
-    pushOutcome: pushOutcomeRecord,
+    newEvidenceStrength: newStrength,
   };
 }
 

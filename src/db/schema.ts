@@ -656,18 +656,6 @@ export const claimFeedback = pgTable(
     // updates on the referenced claim.
     evidenceStrength: doublePrecision("evidence_strength").notNull().default(0.0),
 
-    // Push-channel metadata (optional). When provided, FQA attempts
-    // a direct A2A callback to the reporter before falling back to
-    // the pull inbox. callback_capability tells FQA how aggressively
-    // to try:
-    //   'always_on'    — reporter is a long-lived service, retry once
-    //   'best_effort'  — reporter may be transient, single try
-    //   'none'         — do not attempt push, pull-only
-    enrichmentCallbackUrl: text("enrichment_callback_url"),
-    callbackCapability: text("callback_capability"),
-    pushAttemptedAt: timestamp("push_attempted_at", { withTimezone: true }),
-    pushOutcome: text("push_outcome"),
-
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
@@ -709,19 +697,7 @@ export const claimFeedback = pgTable(
     ),
     check(
       "claim_feedback_enrichment_status_values",
-      sql`${t.enrichmentStatus} IN ('pending','finalized_inferred','awaiting_reporter_push','awaiting_pull','enriched','expired_reporter_unavailable','skipped_backpressure','not_needed')`,
-    ),
-    check(
-      "claim_feedback_callback_capability_values",
-      sql`${t.callbackCapability} IS NULL OR ${t.callbackCapability} IN ('always_on','best_effort','none')`,
-    ),
-    check(
-      "claim_feedback_callback_url_len",
-      sql`${t.enrichmentCallbackUrl} IS NULL OR length(${t.enrichmentCallbackUrl}) <= 2000`,
-    ),
-    check(
-      "claim_feedback_push_outcome_values",
-      sql`${t.pushOutcome} IS NULL OR ${t.pushOutcome} IN ('success','timeout','refused','error','unreachable')`,
+      sql`${t.enrichmentStatus} IN ('pending','finalized_inferred','awaiting_pull','enriched','expired_reporter_unavailable','skipped_backpressure','not_needed')`,
     ),
     check(
       "claim_feedback_reporter_responded_values",

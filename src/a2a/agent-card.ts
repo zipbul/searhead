@@ -129,12 +129,14 @@ to prevent reporters from overwriting their own past submissions.
 reporterAgentId on update must match the row's original reporter.
 
 Notes:
-- enrichmentStatus = 'not_needed' (held or already strong) or 'pending'
-  (awaiting background enrichment).
-- A background worker LLM-infers missing structured fields from
-  audit_note and may HTTP POST to enrichmentCallbackUrl asking for
-  more detail when the claim is high-authority and evidence is weak.
-  The reporter responds via the same skill with the same feedbackId.
+- enrichmentStatus = 'not_needed' (held or already strong), 'pending'
+  (awaiting background LLM enrichment of audit_note), or
+  'awaiting_pull' (background worker decided the claim is worth more
+  detail — call this skill again with the same feedbackId once you
+  have more info).
+- A background worker LLM-infers missing structured fields from the
+  audit_note. Reporters that want to add evidence later re-submit via
+  the same skill with feedbackId set; there is no push channel.
 - evidenceStrength × reporterFeedbackAuthority is the effective weight
   this feedback carries when claim authority is later reconsidered.`,
       examples: [

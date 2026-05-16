@@ -504,7 +504,7 @@ async function migrate() {
         CHECK (reporter_responded IS NULL OR reporter_responded IN (0, 1)),
       enrichment_status TEXT NOT NULL DEFAULT 'pending'
         CHECK (enrichment_status IN
-          ('pending','finalized_inferred','awaiting_reporter_push','awaiting_pull',
+          ('pending','finalized_inferred','awaiting_pull',
            'enriched','expired_reporter_unavailable','skipped_backpressure','not_needed')),
 
       evidence_strength DOUBLE PRECISION NOT NULL DEFAULT 0.0
@@ -519,25 +519,29 @@ async function migrate() {
   await sql`CREATE INDEX IF NOT EXISTS idx_claim_feedback_reporter ON claim_feedback(reporter_agent_id, created_at DESC)`;
   await sql`CREATE INDEX IF NOT EXISTS idx_claim_feedback_enrichment_status ON claim_feedback(enrichment_status)`;
 
-  // Push-channel metadata. Older deployments get these as nullable
-  // adds; new deployments see them on the CREATE above (next minor).
-  await sql`ALTER TABLE claim_feedback ADD COLUMN IF NOT EXISTS enrichment_callback_url TEXT`;
-  await sql`ALTER TABLE claim_feedback ADD COLUMN IF NOT EXISTS callback_capability TEXT`;
-  await sql`ALTER TABLE claim_feedback ADD COLUMN IF NOT EXISTS push_attempted_at TIMESTAMPTZ`;
-  await sql`ALTER TABLE claim_feedback ADD COLUMN IF NOT EXISTS push_outcome TEXT`;
+  // Push-channel cleanup. Earlier v0.4 versions added these columns
+  // for a planned reporter callback path; real-world reporter agents
+  // are almost always transient (no inbound HTTP server) so the push
+  // channel never carried weight. We drop the columns + their
+  // constraints so the schema reflects the final design.
+  await sql`ALTER TABLE claim_feedback DROP CONSTRAINT IF EXISTS claim_feedback_callback_capability_values`;
+  await sql`ALTER TABLE claim_feedback DROP CONSTRAINT IF EXISTS claim_feedback_callback_url_len`;
+  await sql`ALTER TABLE claim_feedback DROP CONSTRAINT IF EXISTS claim_feedback_push_outcome_values`;
+  await sql`ALTER TABLE claim_feedback DROP COLUMN IF EXISTS enrichment_callback_url`;
+  await sql`ALTER TABLE claim_feedback DROP COLUMN IF EXISTS callback_capability`;
+  await sql`ALTER TABLE claim_feedback DROP COLUMN IF EXISTS push_attempted_at`;
+  await sql`ALTER TABLE claim_feedback DROP COLUMN IF EXISTS push_outcome`;
+  // Replace the older enrichment_status CHECK (which allowed
+  // 'awaiting_reporter_push') with the post-push value set.
   await sql`DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'claim_feedback_callback_capability_values') THEN
-      ALTER TABLE claim_feedback ADD CONSTRAINT claim_feedback_callback_capability_values
-        CHECK (callback_capability IS NULL OR callback_capability IN ('always_on','best_effort','none'));
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'claim_feedback_enrichment_status_values') THEN
+      ALTER TABLE claim_feedback DROP CONSTRAINT claim_feedback_enrichment_status_values;
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'claim_feedback_callback_url_len') THEN
-      ALTER TABLE claim_feedback ADD CONSTRAINT claim_feedback_callback_url_len
-        CHECK (enrichment_callback_url IS NULL OR length(enrichment_callback_url) <= 2000);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'claim_feedback_push_outcome_values') THEN
-      ALTER TABLE claim_feedback ADD CONSTRAINT claim_feedback_push_outcome_values
-        CHECK (push_outcome IS NULL OR push_outcome IN ('success','timeout','refused','error','unreachable'));
-    END IF;
+    ALTER TABLE claim_feedback ADD CONSTRAINT claim_feedback_enrichment_status_values
+      CHECK (enrichment_status IN (
+        'pending','finalized_inferred','awaiting_pull','enriched',
+        'expired_reporter_unavailable','skipped_backpressure','not_needed'
+      ));
   END $$`;
 
   // ============================================================
