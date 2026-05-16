@@ -78,10 +78,12 @@ export async function handleContradictions(
       LIMIT ${limit}
     `)) as unknown as typeof rows;
   } else {
-    // Entity mode: link contradictions to claims that *cite* this
-    // entity via the kg_relation table (entity → claim_id linkage).
-    // Both endpoints of the contradicting pair must touch the entity
-    // — otherwise the result conflates unrelated disputes.
+    // Entity mode: surface CONTRADICTS pairs where *at least one*
+    // endpoint cites this entity. The earlier "both endpoints" gate
+    // missed real disputes where a new claim about an entity is
+    // contradicted by a claim that didn't yet have the same entity
+    // attached — both directions of asymmetric mention should
+    // count as "this entity is involved in a dispute".
     rows = (await db.execute(sql`
       WITH entity_claims AS (
         SELECT DISTINCT kr.claim_id
@@ -99,8 +101,10 @@ export async function handleContradictions(
       JOIN claim c1 ON c1.id = cr.source_claim_id
       JOIN claim c2 ON c2.id = cr.target_claim_id
       WHERE cr.relation_type = 'contradicts'
-        AND cr.source_claim_id IN (SELECT claim_id FROM entity_claims)
-        AND cr.target_claim_id IN (SELECT claim_id FROM entity_claims)
+        AND (
+          cr.source_claim_id IN (SELECT claim_id FROM entity_claims)
+          OR cr.target_claim_id IN (SELECT claim_id FROM entity_claims)
+        )
       ORDER BY cr.weight DESC, cr.created_at DESC
       LIMIT ${limit}
     `)) as unknown as typeof rows;

@@ -408,11 +408,10 @@ def _do_train(examples: list[str]) -> int:
             and (baseline is None or accuracy >= baseline - 0.02)  # tiny drift
         )
 
-    # Stage 3: promote (or not). Persist the run row either way so
-    # the next cycle's baseline reflects reality.
-    _persist_eval(eval_result, version_tag, promoted=eligible)
-
     if not eligible:
+        # Persist failure row so the next cycle's baseline reflects
+        # that this attempt was rejected (and why).
+        _persist_eval(eval_result, version_tag, promoted=False)
         reason = (
             "no golden labels and PROMOTE_WITHOUT_EVAL not set"
             if eval_result is None
@@ -424,15 +423,68 @@ def _do_train(examples: list[str]) -> int:
         )
         return 0
 
-    # Promoted: register the history tag and update the latest alias.
+    # Stage 3: actually promote *before* recording promoted=True. If
+    # the Ollama create call silently fails (network glitch, missing
+    # daemon), we must not leave the DB asserting promotion happened.
     history_tag = f"knoldr-judge:{version_tag}"
-    _ollama_create(history_tag, gguf_path)
-    _ollama_create("knoldr-judge:latest", gguf_path)
+    history_ok = _ollama_create_strict(history_tag, gguf_path)
+    latest_ok = _ollama_create_strict("knoldr-judge:latest", gguf_path)
+    if not (history_ok and latest_ok):
+        _persist_eval(eval_result, version_tag, promoted=False)
+        print(
+            "PROMOTE FAILED: ollama create did not succeed; "
+            "staging tag retained, baseline left unchanged."
+        )
+        return 0
+
+    _persist_eval(eval_result, version_tag, promoted=True)
     print(
         f"PROMOTED knoldr-judge:latest -> {version_tag} "
         f"(accuracy={accuracy:.3f}, baseline={baseline})"
     )
     return 0
+
+
+def _ollama_create_strict(tag: str, gguf_path: Path) -> bool:
+    """Strict variant of _ollama_create.
+    Ollama /api/create streams NDJSON. The HTTP layer can return 200
+    while embedding `{"error":"..."}` in a body line — checking only
+    `resp.status` would silently treat a server-side rejection as
+    success. We read the body to completion and look for both:
+      - non-2xx HTTP status
+      - any NDJSON line carrying an `error` field
+    Both → False. Body must be drained even on the failure path so
+    Ollama doesn't see a half-closed connection and abort midway."""
+    payload = json.dumps({"name": tag, "modelfile": f"FROM {gguf_path}"})
+    req = urllib.request.Request(
+        f"{OLLAMA_HOST}/api/create",
+        data=payload.encode(),
+        headers={"content-type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            status = resp.status
+            body = resp.read().decode("utf-8", errors="replace")
+        if not (200 <= status < 300):
+            print(f"WARN: ollama create {tag} returned HTTP {status}; body={body[:300]}")
+            return False
+        # Walk the NDJSON stream — any embedded error line means the
+        # registration didn't actually succeed even though HTTP was 2xx.
+        for line in body.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("error"):
+                print(f"WARN: ollama create {tag} reported error: {obj['error']}")
+                return False
+        return True
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        print(f"WARN: ollama create {tag} failed: {e}")
+        return False
 
 
 def _ollama_create(tag: str, gguf_path: Path) -> None:

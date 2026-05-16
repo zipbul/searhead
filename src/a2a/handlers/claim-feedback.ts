@@ -148,8 +148,19 @@ export async function handleClaimFeedback(
     validated = claimFeedbackInputSchema.parse(input);
   } catch (err) {
     const zerr = err as z.ZodError;
+    // zod v4 emits "Invalid input: expected ..., received undefined"
+    // for missing fields. v4 ZodIssue doesn't expose a `received`
+    // property (only `expected`/`message`/`code`/`path`), so message-
+    // text matching is the only reliable signal. The earlier filter
+    // checked an `i.received` that doesn't exist, which caused every
+    // invalid_type — including wrong-shape inputs — to be classified
+    // as missing. Now we restrict to issues whose message clearly
+    // names "undefined" as the received value.
     const missing = zerr.issues
-      ?.filter((i) => i.code === "invalid_type" && i.message?.includes("required"))
+      ?.filter((i) => {
+        if (i.code !== "invalid_type") return false;
+        return typeof i.message === "string" && /received\s+undefined/i.test(i.message);
+      })
       .map((i) => i.path.join("."));
     return {
       ok: false,

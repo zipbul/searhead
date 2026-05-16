@@ -148,11 +148,14 @@ Notes:
       tags: ["kg", "graph", "entity"],
       description: `Walk the entity KG from a root entity. Returns connected entities up to \`hops\` away, each tagged with its shortest distance and the relation labels on the path.
 
-Input:  { entity: string, relationType?: string, hops?: number (1-4, default 1), limit?: number (default 50) }
+Input:  { entity: string, entityType?: string, relationType?: string, hops?: number (1-4, default 1), limit?: number (default 50) }
 Output: { ok, root: { id, name, type }, neighbors: [{ id, name, type, distance, viaRelations[] }] }
-        | { ok: false, error: "invalid_input"|"entity_not_found", message }
+        | { ok: false, error: "invalid_input"|"entity_not_found"|"ambiguous_entity", message, candidates? }
 
-entity may be either a ULID (entity.id) or a human name (case-insensitive match).`,
+entity may be either a ULID (entity.id) or a human name (case-insensitive match).
+The (type, lower(name)) unique key allows the same name across types — when a
+name resolves to multiple entities the call returns ambiguous_entity with the
+list of candidates so the caller can re-issue with entityType set.`,
       examples: [
         '{ "skill": "neighbors", "input": { "entity": "Bun", "hops": 2 } }',
         '{ "skill": "neighbors", "input": { "entity": "xz-utils", "relationType": "affects", "hops": 1, "limit": 20 } }',

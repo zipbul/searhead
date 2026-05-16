@@ -13,7 +13,7 @@
 // one is safe.
 
 import { ulid } from "ulid";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { db } from "../db/connection";
 import {
   entry,
@@ -203,7 +203,53 @@ export interface GoldenEvalOptions {
   modelVersions?: Record<string, string>;
 }
 
+// Same lock key that finetune/run.py acquires *exclusively* before
+// LoRA training (FT_LOCK_KEY = 0x6B6E6F6C64720001). The eval harness
+// holds a SHARED lock so multiple eval runs can stack but a finetune
+// cycle can't start mid-eval — they'd otherwise contend for GPU /
+// Ollama. Compute the decimal from the hex literal so a typo in
+// either side can't silently desync the two locks (the previous
+// hand-converted decimal was wrong and rendered this coordination
+// inert).
+const FT_LOCK_KEY = BigInt("0x6B6E6F6C64720001").toString();
+
+async function withFinetuneShield<T>(fn: () => Promise<T>): Promise<T> {
+  const { getPgClient } = await import("../db/connection");
+  const client = getPgClient();
+  const reserved = await client.reserve();
+  try {
+    // Try to acquire a SHARED advisory lock — non-blocking. If the
+    // finetune cycle currently holds the EXCLUSIVE lock, we yield
+    // the lock attempt and surface the conflict to the caller.
+    const rows = await reserved<Array<{ ok: boolean }>>`
+      SELECT pg_try_advisory_lock_shared(${FT_LOCK_KEY}::bigint) AS ok
+    `;
+    if (!rows[0]?.ok) {
+      throw new Error(
+        "finetune cycle in progress — eval skipped to avoid GPU/Ollama contention",
+      );
+    }
+    try {
+      return await fn();
+    } finally {
+      try {
+        await reserved`SELECT pg_advisory_unlock_shared(${FT_LOCK_KEY}::bigint)`;
+      } catch {
+        /* best-effort release */
+      }
+    }
+  } finally {
+    reserved.release();
+  }
+}
+
 export async function runGoldenEval(
+  opts: GoldenEvalOptions = {},
+): Promise<EvalResult | null> {
+  return await withFinetuneShield(() => runGoldenEvalInner(opts));
+}
+
+async function runGoldenEvalInner(
   opts: GoldenEvalOptions = {},
 ): Promise<EvalResult | null> {
   const runId = ulid();
@@ -296,9 +342,19 @@ export async function runGoldenEval(
       ? 0
       : supported.reduce((s, v) => s + byVerdict[v].f1, 0) / supported.length;
 
+  // Baseline lookup: pull the most recent run *from Knoldr's own
+  // eval harness only*. finetune/run.py writes accuracy-only rows
+  // into the same table with metric_semantics='accuracy_only';
+  // those numbers (single-task verdict accuracy) are not comparable
+  // to this harness's macro-F1 across the full verify pipeline.
+  // Filtering them out prevents finetune accuracy bleeding into the
+  // pipeline regression check.
   const [prior] = await db
     .select({ id: goldenSetRun.id, f1: goldenSetRun.f1Overall })
     .from(goldenSetRun)
+    .where(
+      sql`COALESCE(${goldenSetRun.metrics}->>'metric_semantics', '') <> 'accuracy_only'`,
+    )
     .orderBy(desc(goldenSetRun.ranAt))
     .limit(1);
 
