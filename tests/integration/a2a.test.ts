@@ -73,7 +73,7 @@ afterAll(async () => {
 // Agent Card
 // ============================================================
 describe("A2A — Agent Card", () => {
-  test("exposes only `find` and `feedback` skills", async () => {
+  test("exposes the v0.4 skill surface", async () => {
     if (!dbAvailable) return;
 
     const res = await fetch(`${A2A_URL}/.well-known/agent-card.json`);
@@ -86,7 +86,15 @@ describe("A2A — Agent Card", () => {
     expect(card.name).toBe("knoldr");
     expect(card.capabilities.streaming).toBe(true);
     const ids = card.skills.map((s) => s.id).sort();
-    expect(ids).toEqual(["feedback", "find"]);
+    expect(ids).toEqual([
+      "claim_feedback",
+      "contradictions",
+      "feedback",
+      "find",
+      "ingest",
+      "neighbors",
+      "provenance",
+    ]);
   });
 });
 

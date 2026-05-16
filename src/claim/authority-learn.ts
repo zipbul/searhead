@@ -140,10 +140,14 @@ export async function recordVerdictTransition(
       .onConflictDoUpdate({
         target: agentFeedbackAuthority.agentId,
         set: {
-          feedbackAuthority: sql`${EMA_ALPHA} * ${sample} + ${1 - EMA_ALPHA} * ${agentFeedbackAuthority.feedbackAuthority}`,
+          // Explicit ::double precision casts — postgres-js sends every
+          // bound literal as `unknown` and `unknown * unknown` has no
+          // unique operator candidate, so the EMA formula fails to
+          // resolve without the cast.
+          feedbackAuthority: sql`${EMA_ALPHA}::double precision * ${sample}::double precision + ${1 - EMA_ALPHA}::double precision * ${agentFeedbackAuthority.feedbackAuthority}`,
           totalFeedbacks: sql`${agentFeedbackAuthority.totalFeedbacks} + 1`,
-          correctFeedbacks: sql`${agentFeedbackAuthority.correctFeedbacks} + ${incCorrect}`,
-          incorrectFeedbacks: sql`${agentFeedbackAuthority.incorrectFeedbacks} + ${incIncorrect}`,
+          correctFeedbacks: sql`${agentFeedbackAuthority.correctFeedbacks} + ${incCorrect}::integer`,
+          incorrectFeedbacks: sql`${agentFeedbackAuthority.incorrectFeedbacks} + ${incIncorrect}::integer`,
           lastUpdatedAt: new Date(),
         },
       });
