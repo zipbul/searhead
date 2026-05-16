@@ -9,9 +9,7 @@
 import { z } from "zod/v4";
 import { callLlm, extractJson } from "../llm/cli";
 import { logger } from "../observability/logger";
-import {
-  FAILURE_DIMENSIONS,
-} from "../a2a/handlers/claim-feedback";
+import { FAILURE_DIMENSIONS } from "../score/feedback-constants";
 
 const inferenceSchema = z.object({
   failure_dimension: z.enum(FAILURE_DIMENSIONS).nullable().optional(),

@@ -23,24 +23,16 @@ import {
 } from "../../db/schema";
 import { logger } from "../../observability/logger";
 import { computeFeedbackEvidenceStrength } from "../../score/feedback-strength";
+import {
+  APPLICATION_METHODS,
+  OUTCOMES,
+  FAILURE_DIMENSIONS,
+} from "../../score/feedback-constants";
+import { enqueueEnrichment } from "../../fqa/queue";
 
-export const APPLICATION_METHODS = [
-  "verified",
-  "applied",
-  "cited",
-  "reasoned_over",
-] as const;
-
-export const OUTCOMES = ["held", "failed", "partial"] as const;
-
-export const FAILURE_DIMENSIONS = [
-  "fully_false",
-  "scope_too_broad",
-  "time_expired",
-  "modality_too_strong",
-  "context_mismatch",
-  "partially_correct",
-] as const;
+// Re-export for external consumers that already import these from
+// here (back-compat after extraction to feedback-constants.ts).
+export { APPLICATION_METHODS, OUTCOMES, FAILURE_DIMENSIONS };
 
 const claimFeedbackInputSchema = z
   .object({
@@ -245,6 +237,15 @@ export async function handleClaimFeedback(
       validated.outcome,
     );
   });
+
+  // Fire-and-forget immediate enrichment: only when the row actually
+  // entered 'pending' state (i.e., it's not 'not_needed' from held
+  // outcome or already-strong evidence). The handler's response
+  // doesn't wait — the agent gets its 100ms ack immediately and the
+  // in-process worker drains enrichment in the background.
+  if (enrichmentStatus === "pending") {
+    enqueueEnrichment(feedbackId);
+  }
 
   // Fetch the reporter's current authority for the response so the
   // caller can see how their feedback will be weighted.
