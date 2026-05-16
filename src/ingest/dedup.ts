@@ -1,7 +1,8 @@
-import { db } from "../db/connection";
-import { entry } from "../db/schema";
-import { sql, eq } from "drizzle-orm";
-import { logger } from "../observability/logger";
+import { sql, eq } from 'drizzle-orm';
+
+import { getDb } from '../db/connection';
+import { entry } from '../db/schema';
+import { logger } from '../observability/logger';
 
 const DISTANCE_THRESHOLD = 0.05; // cosine distance < 0.05 = similarity > 0.95
 const CANDIDATE_LIMIT = 8;
@@ -19,22 +20,20 @@ const CANDIDATE_LIMIT = 8;
  * Filters to status='active' so draft / soft-deleted rows don't count
  * against new ingestions.
  */
-export async function isDuplicate(
-  embedding: number[],
-): Promise<boolean> {
-  const vecStr = `[${embedding.join(",")}]`;
+export async function isDuplicate(embedding: number[]): Promise<boolean> {
+  const vecStr = `[${embedding.join(',')}]`;
 
-  const candidates = await db
+  const candidates = await getDb()
     .select({
       id: entry.id,
       distance: sql<number>`${entry.embedding} <=> ${vecStr}::vector`,
     })
     .from(entry)
-    .where(eq(entry.status, "active"))
+    .where(eq(entry.status, 'active'))
     .orderBy(sql`${entry.embedding} <=> ${vecStr}::vector`)
     .limit(CANDIDATE_LIMIT);
 
-  const duplicates = candidates.filter((c) => c.distance < DISTANCE_THRESHOLD);
+  const duplicates = candidates.filter(c => c.distance < DISTANCE_THRESHOLD);
 
   if (duplicates.length > 0) {
     logger.debug(
@@ -43,7 +42,7 @@ export async function isDuplicate(
         closest: duplicates[0]?.id,
         closestDistance: duplicates[0]?.distance,
       },
-      "duplicate(s) detected",
+      'duplicate(s) detected',
     );
   }
 

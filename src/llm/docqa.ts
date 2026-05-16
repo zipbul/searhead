@@ -1,7 +1,8 @@
-import { logger } from "../observability/logger";
-import { z } from "zod/v4";
-import { callLlm, extractJson } from "./cli";
-import { loadWithDeviceFallback } from "./device";
+import { z } from 'zod/v4';
+
+import { logger } from '../observability/logger';
+import { callLlm, extractJson } from './cli';
+import { loadWithDeviceFallback } from './device';
 
 // Question-Answering verifier (DocQA).
 //
@@ -17,23 +18,27 @@ import { loadWithDeviceFallback } from "./device";
 // but covers most claims; Korean claims hit the translate fallback
 // upstream of this module.
 
-const QA_MODEL = process.env.KNOLDR_QA_MODEL ?? "Xenova/distilbert-base-cased-distilled-squad";
+const QA_MODEL = process.env.KNOLDR_QA_MODEL ?? 'Xenova/distilbert-base-cased-distilled-squad';
 
 let qaPipeline: ((question: string, context: string) => Promise<{ answer: string; score: number }>) | null = null;
 let loadingQa: Promise<typeof qaPipeline> | null = null;
 
 async function getQaPipeline() {
-  if (qaPipeline) return qaPipeline;
-  if (loadingQa) return loadingQa;
+  if (qaPipeline) {
+    return qaPipeline;
+  }
+  if (loadingQa) {
+    return loadingQa;
+  }
   loadingQa = (async () => {
-    const { pipeline } = await import("@huggingface/transformers");
-    qaPipeline = (await loadWithDeviceFallback(QA_MODEL, (device) =>
-      pipeline("question-answering", QA_MODEL, {
-        dtype: "q8",
+    const { pipeline } = await import('@huggingface/transformers');
+    qaPipeline = (await loadWithDeviceFallback(QA_MODEL, device =>
+      pipeline('question-answering', QA_MODEL, {
+        dtype: 'q8',
         device,
       } as unknown as Record<string, unknown>),
     )) as unknown as typeof qaPipeline;
-    logger.info({ model: QA_MODEL }, "QA model loaded");
+    logger.info({ model: QA_MODEL }, 'QA model loaded');
     return qaPipeline;
   })();
   return loadingQa;
@@ -59,12 +64,12 @@ async function buildQuestion(claim: string): Promise<{ question: string; expecte
     const out = await callLlm({ system: QUESTION_PROMPT, user: claim.slice(0, 500) });
     return questionSchema.parse(extractJson(out));
   } catch (err) {
-    logger.debug({ error: (err as Error).message }, "QA question generation failed");
+    logger.debug({ error: (err as Error).message }, 'QA question generation failed');
     return null;
   }
 }
 
-export interface QaResult {
+interface QaResult {
   question: string;
   expected: string;
   extracted: string;
@@ -80,18 +85,20 @@ export interface QaResult {
  */
 export async function qaVerify(claim: string, context: string): Promise<QaResult | null> {
   const q = await buildQuestion(claim);
-  if (!q) return null;
+  if (!q) {
+    return null;
+  }
 
   const pipe = await getQaPipeline();
-  if (!pipe) return null;
+  if (!pipe) {
+    return null;
+  }
 
   const out = await pipe(q.question, context.slice(0, 4000));
-  const extracted = (out.answer ?? "").trim();
+  const extracted = (out.answer ?? '').trim();
   const expected = q.expected.toLowerCase();
   const supports =
-    extracted.length > 0 &&
-    (extracted.toLowerCase().includes(expected) ||
-      expected.includes(extracted.toLowerCase()));
+    extracted.length > 0 && (extracted.toLowerCase().includes(expected) || expected.includes(extracted.toLowerCase()));
 
   return {
     question: q.question,

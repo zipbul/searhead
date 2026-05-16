@@ -1,4 +1,4 @@
-import { logger } from "../observability/logger";
+import { logger } from '../observability/logger';
 
 // Bespoke-MiniCheck-7B verifier (current SOTA on LLM-AggreFact at
 // 77.4% balanced accuracy — beats Claude 3.5 Sonnet and GPT-4 on
@@ -16,10 +16,10 @@ import { logger } from "../observability/logger";
 // (Q4_K_M as of pull time) — accuracy degradation vs full precision
 // is minimal on this task per the Bespoke Labs evals.
 
-const OLLAMA_HOST = process.env.OLLAMA_HOST ?? "http://localhost:11434";
-const BESPOKE_MODEL = process.env.KNOLDR_BESPOKE_MODEL ?? "bespoke-minicheck";
+const OLLAMA_HOST = process.env.OLLAMA_HOST ?? 'http://localhost:11434';
+const BESPOKE_MODEL = process.env.KNOLDR_BESPOKE_MODEL ?? 'bespoke-minicheck';
 
-export interface BespokeResult {
+interface BespokeResult {
   supported: boolean;
   /** Confidence in [0, 1] derived from raw model output. */
   confidence: number;
@@ -34,14 +34,11 @@ const BESPOKE_PROMPT = (document: string, claim: string) =>
  * Returns null on transport failure so callers can downgrade
  * gracefully to NLI-only.
  */
-export async function bespokeCheck(
-  document: string,
-  claim: string,
-): Promise<BespokeResult | null> {
+async function bespokeCheck(document: string, claim: string): Promise<BespokeResult | null> {
   try {
     const res = await fetch(`${OLLAMA_HOST}/api/generate`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         model: BESPOKE_MODEL,
         prompt: BESPOKE_PROMPT(document, claim),
@@ -50,11 +47,11 @@ export async function bespokeCheck(
       }),
     });
     if (!res.ok) {
-      logger.debug({ status: res.status }, "bespoke-minicheck HTTP error");
+      logger.debug({ status: res.status }, 'bespoke-minicheck HTTP error');
       return null;
     }
     const json = (await res.json()) as { response?: string };
-    const raw = (json.response ?? "").trim();
+    const raw = (json.response ?? '').trim();
     const lower = raw.toLowerCase();
     // Recognize the common English affirmatives/negatives at word
     // boundaries. The previous `startsWith` missed "yeah", "yep",
@@ -68,7 +65,9 @@ export async function bespokeCheck(
     // Ambiguous — treat as low-confidence "neutral".
     return { supported: false, confidence: 0.3, rawAnswer: raw };
   } catch (err) {
-    logger.debug({ error: (err as Error).message }, "bespoke-minicheck call failed");
+    logger.debug({ error: (err as Error).message }, 'bespoke-minicheck call failed');
     return null;
   }
 }
+
+export { bespokeCheck };

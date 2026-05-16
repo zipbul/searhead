@@ -1,4 +1,6 @@
-import type { NliScores } from "../llm/nli";
+import type { NliScores } from '../llm/nli';
+
+import { Verdict } from '../score/enums';
 
 // Bayesian belief aggregation over multiple sources.
 //
@@ -14,15 +16,15 @@ import type { NliScores } from "../llm/nli";
 // determines direction. Independent groups (after dedup) carry full
 // weight, redundant sources within a group are damped.
 
-export interface SourceEvidence {
+interface SourceEvidence {
   scores: NliScores;
   authority: number;
   /** Index of the independence group this source belongs to. */
   group: number;
 }
 
-export interface AggregateResult {
-  verdict: "verified" | "disputed" | "unverified";
+interface AggregateResult {
+  verdict: Verdict.Verified | Verdict.Disputed | Verdict.Unverified;
   certainty: number;
   /** Posterior probability that the claim is true. */
   posterior: number;
@@ -60,9 +62,9 @@ function sigmoid(x: number): number {
  * produced different posteriors on the same evidence (reproduced as
  * 0.97 vs 0.88 in testing).
  */
-export function aggregate(sources: SourceEvidence[]): AggregateResult {
+function aggregate(sources: SourceEvidence[]): AggregateResult {
   if (sources.length === 0) {
-    return { verdict: "unverified", certainty: 0, posterior: PRIOR };
+    return { verdict: Verdict.Unverified, certainty: 0, posterior: PRIOR };
   }
 
   // Bucket by group first, then within each bucket sort by authority
@@ -90,17 +92,20 @@ export function aggregate(sources: SourceEvidence[]): AggregateResult {
   }
 
   const posterior = sigmoid(logOdds);
-  let verdict: AggregateResult["verdict"];
+  let verdict: AggregateResult['verdict'];
   let certainty: number;
   if (posterior >= VERIFIED_THRESHOLD) {
-    verdict = "verified";
+    verdict = Verdict.Verified;
     certainty = posterior;
   } else if (posterior <= DISPUTED_THRESHOLD) {
-    verdict = "disputed";
+    verdict = Verdict.Disputed;
     certainty = 1 - posterior;
   } else {
-    verdict = "unverified";
+    verdict = Verdict.Unverified;
     certainty = Math.max(posterior, 1 - posterior);
   }
   return { verdict, certainty, posterior };
 }
+
+export { aggregate };
+export type { SourceEvidence };

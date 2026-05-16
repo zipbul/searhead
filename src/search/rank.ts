@@ -1,4 +1,4 @@
-export interface RawRow {
+interface RawRow {
   id: string;
   title: string;
   content: string;
@@ -14,7 +14,7 @@ export interface RawRow {
   sources: Array<{ url: string; sourceType: string; trust: number }>;
 }
 
-export interface ScoredEntry {
+interface ScoredEntry {
   id: string;
   title: string;
   content: string;
@@ -29,7 +29,7 @@ export interface ScoredEntry {
   sources: Array<{ url: string; sourceType: string; trust: number }>;
 }
 
-export interface ScoreBreakdown {
+interface ScoreBreakdown {
   relevance: number;
   authority: number;
   freshness: number;
@@ -37,7 +37,7 @@ export interface ScoreBreakdown {
   final: number;
 }
 
-export interface RankResult {
+interface RankResult {
   entries: ScoredEntry[];
   scores: ScoreBreakdown[];
   trustLevels: string[];
@@ -54,11 +54,7 @@ export interface RankResult {
  * that passed FTS on a single incidental term. When queryTerms is empty,
  * defaults to 1.0 (no signal available, don't penalize).
  */
-export function rank(
-  rows: RawRow[],
-  mode: "query" | "explore",
-  queryTerms: string[] = [],
-): RankResult {
+function rank(rows: RawRow[], mode: 'query' | 'explore', queryTerms: string[] = []): RankResult {
   if (rows.length === 0) {
     return { entries: [], scores: [], trustLevels: [] };
   }
@@ -66,22 +62,15 @@ export function rank(
   const now = Date.now();
 
   // Min-max normalize pgroonga scores (per-query, not global)
-  const rawScores = rows.map((r) => r.pgroongaScore);
+  const rawScores = rows.map(r => r.pgroongaScore);
   const minScore = Math.min(...rawScores);
   const maxScore = Math.max(...rawScores);
   const scoreRange = maxScore - minScore;
 
-  const normalizedTerms = queryTerms
-    .map((t) => t.toLowerCase())
-    .filter((t) => t.length > 0);
+  const normalizedTerms = queryTerms.map(t => t.toLowerCase()).filter(t => t.length > 0);
 
-  const scored = rows.map((row) => {
-    const relevance =
-      mode === "explore"
-        ? 0
-        : scoreRange === 0
-          ? 1.0
-          : (row.pgroongaScore - minScore) / scoreRange;
+  const scored = rows.map(row => {
+    const relevance = mode === 'explore' ? 0 : scoreRange === 0 ? 1.0 : (row.pgroongaScore - minScore) / scoreRange;
 
     const authority = row.authority;
     // Use publication date from source metadata when available; fall back to
@@ -91,10 +80,7 @@ export function rank(
     // publication in the future.
     const metaDate = extractPublishedAt(row.metadata);
     const referenceDate = metaDate && metaDate.getTime() <= now ? metaDate : row.createdAt;
-    const daysSinceReference = Math.max(
-      0,
-      (now - referenceDate.getTime()) / (1000 * 60 * 60 * 24),
-    );
+    const daysSinceReference = Math.max(0, (now - referenceDate.getTime()) / (1000 * 60 * 60 * 24));
     const freshness = Math.exp(-row.decayRate * daysSinceReference);
 
     let termCoverage = 1.0;
@@ -105,14 +91,11 @@ export function rank(
       // boundaries implemented via negative lookaround (the native \b
       // only considers ASCII word chars).
       const text = `${row.title} ${row.content}`.toLowerCase();
-      const matched = normalizedTerms.filter((t) => containsWord(text, t)).length;
+      const matched = normalizedTerms.filter(t => containsWord(text, t)).length;
       termCoverage = matched / normalizedTerms.length;
     }
 
-    const final =
-      mode === "query"
-        ? relevance * 0.5 + authority * 0.2 + freshness * 0.3
-        : authority * 0.4 + freshness * 0.6;
+    const final = mode === 'query' ? relevance * 0.5 + authority * 0.2 + freshness * 0.3 : authority * 0.4 + freshness * 0.6;
 
     const trustLevel = getTrustLevel(authority);
 
@@ -140,35 +123,45 @@ export function rank(
   scored.sort((a, b) => b.score.final - a.score.final || b.entry.id.localeCompare(a.entry.id));
 
   return {
-    entries: scored.map((s) => s.entry),
-    scores: scored.map((s) => s.score),
-    trustLevels: scored.map((s) => s.trustLevel),
+    entries: scored.map(s => s.entry),
+    scores: scored.map(s => s.score),
+    trustLevels: scored.map(s => s.trustLevel),
   };
 }
 
 function getTrustLevel(authority: number): string {
-  if (authority >= 0.7) return "high";
-  if (authority >= 0.4) return "medium";
-  return "low";
+  if (authority >= 0.7) {
+    return 'high';
+  }
+  if (authority >= 0.4) {
+    return 'medium';
+  }
+  return 'low';
 }
 
 function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function containsWord(haystack: string, term: string): boolean {
-  if (!term) return false;
-  const re = new RegExp(
-    `(?:^|[^\\p{L}\\p{N}])${escapeRegex(term)}(?:[^\\p{L}\\p{N}]|$)`,
-    "u",
-  );
+  if (!term) {
+    return false;
+  }
+  const re = new RegExp(`(?:^|[^\\p{L}\\p{N}])${escapeRegex(term)}(?:[^\\p{L}\\p{N}]|$)`, 'u');
   return re.test(haystack);
 }
 
 function extractPublishedAt(metadata: unknown): Date | null {
-  if (!metadata || typeof metadata !== "object") return null;
+  if (!metadata || typeof metadata !== 'object') {
+    return null;
+  }
   const raw = (metadata as Record<string, unknown>).publishedAt;
-  if (typeof raw !== "string") return null;
+  if (typeof raw !== 'string') {
+    return null;
+  }
   const d = new Date(raw);
   return isNaN(d.getTime()) ? null : d;
 }
+
+export { rank };
+export type { RawRow, ScoredEntry, ScoreBreakdown };

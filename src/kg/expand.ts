@@ -1,6 +1,7 @@
-import { sql } from "drizzle-orm";
-import { db } from "../db/connection";
-import { extractTriples } from "./extract";
+import { sql } from 'drizzle-orm';
+
+import { getDb } from '../db/connection';
+import { extractTriples } from './extract';
 
 // Short-lived memoization: a single verify run hits expandWithKgFacts
 // once for the parent claim, and once per CoVe sub-claim — previously
@@ -16,7 +17,7 @@ const CACHE_TTL_MS = 2 * 60 * 1000;
 const cache = new Map<string, CachedFacts>();
 
 function cacheKey(claim: string): string {
-  return claim.toLowerCase().replace(/\s+/g, " ").trim().slice(0, 500);
+  return claim.toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 500);
 }
 
 // KG premise expansion.
@@ -51,12 +52,14 @@ interface KgFact {
 export async function expandWithKgFacts(claim: string): Promise<string> {
   const key = cacheKey(claim);
   const hit = cache.get(key);
-  if (hit && Date.now() < hit.expiresAt) return hit.value;
+  if (hit && Date.now() < hit.expiresAt) {
+    return hit.value;
+  }
 
   const triples = await extractTriples(claim);
   if (triples.length === 0) {
-    cache.set(key, { value: "", expiresAt: Date.now() + CACHE_TTL_MS });
-    return "";
+    cache.set(key, { value: '', expiresAt: Date.now() + CACHE_TTL_MS });
+    return '';
   }
 
   const entityNames = new Set<string>();
@@ -64,15 +67,20 @@ export async function expandWithKgFacts(claim: string): Promise<string> {
     entityNames.add(t.subject.name.trim().toLowerCase());
     entityNames.add(t.object.name.trim().toLowerCase());
   }
-  if (entityNames.size === 0) return "";
+  if (entityNames.size === 0) {
+    return '';
+  }
 
   const names = Array.from(entityNames);
   // Drizzle's tagged template expands array bindings positionally,
   // so ANY(${names}) becomes ANY(($1, $2, ...)) — not a valid Postgres
   // array literal. Build the array as a single bind via sql.array
   // (text[]) so ANY() sees one parameter.
-  const namesArr = sql`ARRAY[${sql.join(names.map((n) => sql`${n}`), sql`, `)}]::text[]`;
-  const rows = (await db.execute(sql`
+  const namesArr = sql`ARRAY[${sql.join(
+    names.map(n => sql`${n}`),
+    sql`, `,
+  )}]::text[]`;
+  const rows = (await getDb().execute(sql`
     SELECT
       src.name AS subject,
       r.relation_type AS predicate,
@@ -88,13 +96,15 @@ export async function expandWithKgFacts(claim: string): Promise<string> {
   `)) as unknown as KgFact[];
 
   if (rows.length === 0) {
-    cache.set(key, { value: "", expiresAt: Date.now() + CACHE_TTL_MS });
-    return "";
+    cache.set(key, { value: '', expiresAt: Date.now() + CACHE_TTL_MS });
+    return '';
   }
 
-  const sentences = rows.map((r) => `${r.subject} ${r.predicate.replace(/_/g, " ")} ${r.object}.`);
-  let out = `Known facts: ${sentences.join(" ")}\n\n`;
-  if (out.length > MAX_FACT_CHARS) out = out.slice(0, MAX_FACT_CHARS) + "\n\n";
+  const sentences = rows.map(r => `${r.subject} ${r.predicate.replace(/_/g, ' ')} ${r.object}.`);
+  let out = `Known facts: ${sentences.join(' ')}\n\n`;
+  if (out.length > MAX_FACT_CHARS) {
+    out = out.slice(0, MAX_FACT_CHARS) + '\n\n';
+  }
   cache.set(key, { value: out, expiresAt: Date.now() + CACHE_TTL_MS });
   return out;
 }

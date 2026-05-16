@@ -1,8 +1,9 @@
-import { sql, eq, and, inArray } from "drizzle-orm";
-import { db } from "../db/connection";
-import { entry, entryDomain, entryTag } from "../db/schema";
-import { classifyBatch } from "./classify-batch";
-import { logger } from "../observability/logger";
+import { sql, eq, and, inArray } from 'drizzle-orm';
+
+import { getDb } from '../db/connection';
+import { entry, entryDomain, entryTag } from '../db/schema';
+import { logger } from '../observability/logger';
+import { classifyBatch } from './classify-batch';
 
 /**
  * Reclassify entries that were stored with default/fallback metadata.
@@ -15,7 +16,7 @@ import { logger } from "../observability/logger";
  */
 export async function processReclassifyQueue(batchSize = 3): Promise<number> {
   // Find entries with 0 tags (strong signal of default metadata)
-  const rows = await db.execute(sql`
+  const rows = await getDb().execute(sql`
     SELECT e.id, e.title, e.content, e.created_at
     FROM entry e
     WHERE e.status = 'active'
@@ -34,20 +35,23 @@ export async function processReclassifyQueue(batchSize = 3): Promise<number> {
     created_at: Date | string;
   }>;
 
-  if (batch.length === 0) return 0;
+  if (batch.length === 0) {
+    return 0;
+  }
 
   // Derive topic from the existing domains on each entry. Without
   // this, the previous hardcoded `topic = "general"` starved the
   // classifier of any contextual signal and it fell back to
   // undifferentiated default tags, entrenching the very "0 tags"
   // state this worker was supposed to fix.
-  const ids = batch.map((r) => r.id);
-  const domains = ids.length > 0
-    ? await db
-        .select({ entryId: entryDomain.entryId, domain: entryDomain.domain })
-        .from(entryDomain)
-        .where(inArray(entryDomain.entryId, ids))
-    : [];
+  const ids = batch.map(r => r.id);
+  const domains =
+    ids.length > 0
+      ? await getDb()
+          .select({ entryId: entryDomain.entryId, domain: entryDomain.domain })
+          .from(entryDomain)
+          .where(inArray(entryDomain.entryId, ids))
+      : [];
   const domainsByEntry = new Map<string, string[]>();
   for (const d of domains) {
     const arr = domainsByEntry.get(d.entryId) ?? [];
@@ -56,8 +60,10 @@ export async function processReclassifyQueue(batchSize = 3): Promise<number> {
   }
   const topicForEntry = (entryId: string): string => {
     const ds = domainsByEntry.get(entryId);
-    if (!ds || ds.length === 0) return "general";
-    return ds.slice(0, 3).join(", ");
+    if (!ds || ds.length === 0) {
+      return 'general';
+    }
+    return ds.slice(0, 3).join(', ');
   };
 
   // classifyBatch takes a single `topic` per call; batch per-entry
@@ -67,16 +73,18 @@ export async function processReclassifyQueue(batchSize = 3): Promise<number> {
   // preserving batch throughput.
   const allDomains = [...domainsByEntry.values()].flat();
   const topicCounts = new Map<string, number>();
-  for (const d of allDomains) topicCounts.set(d, (topicCounts.get(d) ?? 0) + 1);
+  for (const d of allDomains) {
+    topicCounts.set(d, (topicCounts.get(d) ?? 0) + 1);
+  }
   const dominant = [...topicCounts.entries()]
     .sort((a, b) => b[1] - a[1])
-    .map((e) => e[0])
+    .map(e => e[0])
     .slice(0, 3)
-    .join(", ");
-  const topic = dominant || batch.map((r) => topicForEntry(r.id)).find(Boolean) || "general";
+    .join(', ');
+  const topic = dominant || batch.map(r => topicForEntry(r.id)).find(Boolean) || 'general';
 
   const metas = await classifyBatch(
-    batch.map((r) => ({ title: r.title, text: r.content.slice(0, 800) })),
+    batch.map(r => ({ title: r.title, text: r.content.slice(0, 800) })),
     topic,
   );
 
@@ -84,15 +92,15 @@ export async function processReclassifyQueue(batchSize = 3): Promise<number> {
   for (let i = 0; i < batch.length; i++) {
     const row = batch[i]!;
     const meta = metas[i]!;
-    const createdAt = row.created_at instanceof Date
-      ? row.created_at
-      : new Date(row.created_at);
+    const createdAt = row.created_at instanceof Date ? row.created_at : new Date(row.created_at);
 
     // Skip if classify returned defaults (tags still empty = LLM failed)
-    if (meta.tags.length === 0 && meta.domain.length <= 1) continue;
+    if (meta.tags.length === 0 && meta.domain.length <= 1) {
+      continue;
+    }
 
     try {
-      await db.transaction(async (tx) => {
+      await getDb().transaction(async tx => {
         // Update decay rate
         await tx
           .update(entry)
@@ -100,19 +108,12 @@ export async function processReclassifyQueue(batchSize = 3): Promise<number> {
           .where(and(eq(entry.id, row.id), eq(entry.createdAt, createdAt)));
 
         // Replace domains
-        await tx
-          .delete(entryDomain)
-          .where(
-            and(
-              eq(entryDomain.entryId, row.id),
-              eq(entryDomain.entryCreatedAt, createdAt),
-            ),
-          );
+        await tx.delete(entryDomain).where(and(eq(entryDomain.entryId, row.id), eq(entryDomain.entryCreatedAt, createdAt)));
         if (meta.domain.length > 0) {
           await tx
             .insert(entryDomain)
             .values(
-              meta.domain.map((d) => ({
+              meta.domain.map(d => ({
                 entryId: row.id,
                 entryCreatedAt: createdAt,
                 domain: d,
@@ -129,7 +130,7 @@ export async function processReclassifyQueue(batchSize = 3): Promise<number> {
           await tx
             .insert(entryTag)
             .values(
-              meta.tags.map((t) => ({
+              meta.tags.map(t => ({
                 entryId: row.id,
                 entryCreatedAt: createdAt,
                 tag: t,
@@ -140,15 +141,12 @@ export async function processReclassifyQueue(batchSize = 3): Promise<number> {
       });
       processed++;
     } catch (err) {
-      logger.warn(
-        { entryId: row.id, error: (err as Error).message },
-        "reclassify failed",
-      );
+      logger.warn({ entryId: row.id, error: (err as Error).message }, 'reclassify failed');
     }
   }
 
   if (processed > 0) {
-    logger.info({ processed, batchSize }, "reclassify batch processed");
+    logger.info({ processed, batchSize }, 'reclassify batch processed');
   }
   return processed;
 }

@@ -1,7 +1,8 @@
-import { sql } from "drizzle-orm";
-import { db } from "../db/connection";
-import { calibrationState } from "../db/schema";
-import { logger } from "../observability/logger";
+import { sql } from 'drizzle-orm';
+
+import { getDb } from '../db/connection';
+import { calibrationState } from '../db/schema';
+import { logger } from '../observability/logger';
 
 // Auto-calibration of NLI thresholds.
 //
@@ -19,7 +20,7 @@ import { logger } from "../observability/logger";
 // accumulates evidence — no human labels needed.
 
 interface CalibrationSample {
-  consensus: "verified" | "disputed";
+  consensus: 'verified' | 'disputed';
   entailment: number;
   contradiction: number;
 }
@@ -45,35 +46,34 @@ interface CalibrationResult {
 const MAX_CALIBRATION_SAMPLES = 5000;
 
 async function collectSamples(): Promise<CalibrationSample[]> {
-  const rows = (await db.execute(sql`
+  const rows = (await getDb().execute(sql`
     SELECT
       verdict::text AS consensus,
       (evidence->'sourceChecks'->0->'scores'->>'entailment')::float AS entailment,
       (evidence->'sourceChecks'->0->'scores'->>'contradiction')::float AS contradiction
     FROM claim
-    WHERE evidence->>'source' = 'source_check'
+    WHERE evidence->>'source' = 'source-check'
       AND verdict IN ('verified','disputed')
       AND evidence->'sourceChecks'->0->'scores' IS NOT NULL
     ORDER BY created_at DESC
     LIMIT ${MAX_CALIBRATION_SAMPLES}
   `)) as unknown as CalibrationSample[];
   return rows.filter(
-    (r) =>
+    r =>
       Number.isFinite(r.entailment) &&
       Number.isFinite(r.contradiction) &&
-      (r.consensus === "verified" || r.consensus === "disputed"),
+      (r.consensus === 'verified' || r.consensus === 'disputed'),
   );
 }
 
 function f1(precision: number, recall: number): number {
-  if (precision + recall === 0) return 0;
+  if (precision + recall === 0) {
+    return 0;
+  }
   return (2 * precision * recall) / (precision + recall);
 }
 
-function bestThresholdForLabel(
-  samples: CalibrationSample[],
-  label: "verified" | "disputed",
-): { threshold: number; f1: number } {
+function bestThresholdForLabel(samples: CalibrationSample[], label: 'verified' | 'disputed'): { threshold: number; f1: number } {
   let bestT = 0.7;
   let bestF1 = 0;
   for (const t of CANDIDATES) {
@@ -81,12 +81,16 @@ function bestThresholdForLabel(
     let fp = 0;
     let fn = 0;
     for (const s of samples) {
-      const score = label === "verified" ? s.entailment : s.contradiction;
+      const score = label === 'verified' ? s.entailment : s.contradiction;
       const predicted = score >= t;
       const actual = s.consensus === label;
-      if (predicted && actual) tp++;
-      else if (predicted && !actual) fp++;
-      else if (!predicted && actual) fn++;
+      if (predicted && actual) {
+        tp++;
+      } else if (predicted && !actual) {
+        fp++;
+      } else if (!predicted && actual) {
+        fn++;
+      }
     }
     const precision = tp + fp === 0 ? 0 : tp / (tp + fp);
     const recall = tp + fn === 0 ? 0 : tp / (tp + fn);
@@ -99,15 +103,15 @@ function bestThresholdForLabel(
   return { threshold: bestT, f1: bestF1 };
 }
 
-export async function calibrate(): Promise<CalibrationResult | null> {
+async function calibrate(): Promise<CalibrationResult | null> {
   const samples = await collectSamples();
   if (samples.length < MIN_SAMPLES) {
-    logger.debug({ samples: samples.length }, "calibration skipped (insufficient samples)");
+    logger.debug({ samples: samples.length }, 'calibration skipped (insufficient samples)');
     return null;
   }
 
-  const support = bestThresholdForLabel(samples, "verified");
-  const refute = bestThresholdForLabel(samples, "disputed");
+  const support = bestThresholdForLabel(samples, 'verified');
+  const refute = bestThresholdForLabel(samples, 'disputed');
   const result: CalibrationResult = {
     supportThreshold: support.threshold,
     refuteThreshold: refute.threshold,
@@ -115,7 +119,7 @@ export async function calibrate(): Promise<CalibrationResult | null> {
     bestF1: (support.f1 + refute.f1) / 2,
   };
 
-  await db
+  await getDb()
     .update(calibrationState)
     .set({
       nliSupportThreshold: result.supportThreshold,
@@ -126,7 +130,7 @@ export async function calibrate(): Promise<CalibrationResult | null> {
     })
     .where(sql`id = 1`);
 
-  logger.info(result, "calibration updated");
+  logger.info(result, 'calibration updated');
   return result;
 }
 
@@ -140,12 +144,12 @@ let cached: { support: number; refute: number; ts: number } = {
 };
 const CACHE_TTL_MS = 60_000;
 
-export async function getCurrentThresholds(): Promise<{ support: number; refute: number }> {
+async function getCurrentThresholds(): Promise<{ support: number; refute: number }> {
   if (Date.now() - cached.ts < CACHE_TTL_MS) {
     return { support: cached.support, refute: cached.refute };
   }
   try {
-    const [row] = await db
+    const [row] = await getDb()
       .select({
         support: calibrationState.nliSupportThreshold,
         refute: calibrationState.nliRefuteThreshold,
@@ -160,3 +164,5 @@ export async function getCurrentThresholds(): Promise<{ support: number; refute:
   }
   return { support: cached.support, refute: cached.refute };
 }
+
+export { calibrate, getCurrentThresholds };

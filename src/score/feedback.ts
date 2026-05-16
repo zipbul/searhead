@@ -1,10 +1,11 @@
-import { ulid } from "ulid";
-import { db } from "../db/connection";
-import { entry, feedbackLog } from "../db/schema";
-import { sql, eq, and } from "drizzle-orm";
-import { decodeUlidTimestamp } from "../lib/ulid-utils";
-import { logger } from "../observability/logger";
-import { feedbackTotal } from "../observability/metrics";
+import { sql, eq, and } from 'drizzle-orm';
+import { ulid } from 'ulid';
+
+import { getDb } from '../db/connection';
+import { entry, feedbackLog } from '../db/schema';
+import { decodeUlidTimestamp } from '../lib/ulid-utils';
+import { logger } from '../observability/logger';
+import { feedbackTotal } from '../observability/metrics';
 
 interface FeedbackResult {
   entryId: string;
@@ -37,7 +38,7 @@ interface FeedbackResult {
  */
 export async function processFeedback(
   entryId: string,
-  signal: "positive" | "negative",
+  signal: 'positive' | 'negative',
   reason: string | undefined,
   agentId: string,
 ): Promise<FeedbackResult> {
@@ -45,7 +46,7 @@ export async function processFeedback(
   const entryCreatedAt = new Date(decodeUlidTimestamp(entryId));
   const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
 
-  return db.transaction(async (tx) => {
+  return getDb().transaction(async tx => {
     // Row-lock the target entry. Any concurrent feedback TX on the same
     // entry blocks here until we commit/rollback. postgres-js's raw
     // binding doesn't accept Date objects for TIMESTAMPTZ parameters
@@ -56,7 +57,9 @@ export async function processFeedback(
       FOR UPDATE
     `);
     const lockedRow = (locked as unknown as Array<{ authority: number }>)[0];
-    if (!lockedRow) throw new Error(`Entry not found: ${entryId}`);
+    if (!lockedRow) {
+      throw new Error(`Entry not found: ${entryId}`);
+    }
     const priorAuthority = lockedRow.authority;
 
     // Rate limits are computed inside the TX against the committed log;
@@ -69,7 +72,7 @@ export async function processFeedback(
         AND created_at > ${oneHourAgo.toISOString()}::timestamptz
     `);
     if (((agentRecent as unknown as Array<{ cnt: number }>)[0]?.cnt ?? 0) > 0) {
-      throw new RateLimitError("same agent+entry feedback limited to 1 per hour");
+      throw new RateLimitError('same agent+entry feedback limited to 1 per hour');
     }
 
     const entryRecent = await tx.execute(sql`
@@ -78,7 +81,7 @@ export async function processFeedback(
         AND created_at > ${oneHourAgo.toISOString()}::timestamptz
     `);
     if (((entryRecent as unknown as Array<{ cnt: number }>)[0]?.cnt ?? 0) >= 10) {
-      throw new RateLimitError("entry feedback limited to 10 per hour");
+      throw new RateLimitError('entry feedback limited to 10 per hour');
     }
 
     // Authority update math:
@@ -91,10 +94,8 @@ export async function processFeedback(
     //     legitimately useful entry that started with no sources can
     //     earn authority through positive feedback. Ceiling 1.0.
     let newAuthority: number;
-    if (signal === "negative") {
-      newAuthority = priorAuthority > 0.05
-        ? Math.max(0.05, priorAuthority * 0.8)
-        : priorAuthority * 0.8;
+    if (signal === 'negative') {
+      newAuthority = priorAuthority > 0.05 ? Math.max(0.05, priorAuthority * 0.8) : priorAuthority * 0.8;
     } else {
       const BOOTSTRAP = 0.05;
       const boosted = priorAuthority > 0 ? priorAuthority * 1.1 : BOOTSTRAP;
@@ -116,7 +117,7 @@ export async function processFeedback(
     });
 
     feedbackTotal.inc({ signal });
-    logger.info({ entryId, signal, newAuthority, agentId }, "feedback processed");
+    logger.info({ entryId, signal, newAuthority, agentId }, 'feedback processed');
 
     return { entryId, newAuthority };
   });
@@ -125,6 +126,6 @@ export async function processFeedback(
 export class RateLimitError extends Error {
   constructor(message: string) {
     super(message);
-    this.name = "RateLimitError";
+    this.name = 'RateLimitError';
   }
 }

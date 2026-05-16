@@ -1,4 +1,4 @@
-import { timingSafeEqual } from "node:crypto";
+import { timingSafeEqual } from 'node:crypto';
 
 /**
  * Validate Bearer token from Authorization header.
@@ -14,17 +14,23 @@ import { timingSafeEqual } from "node:crypto";
  * Comparison uses node:crypto `timingSafeEqual` over fixed-size buffers so
  * an attacker cannot learn token bytes from response-time variance.
  */
-export function authenticate(request: Request): boolean {
+function authenticate(request: Request): boolean {
   const token = process.env.KNOLDR_API_TOKEN;
   if (!token) {
-    if (process.env.NODE_ENV === "production") return false;
+    if (process.env.NODE_ENV === 'production') {
+      return false;
+    }
     return true;
   }
 
-  const authHeader = request.headers.get("authorization");
-  if (!authHeader) return false;
-  const [scheme, value] = authHeader.split(" ");
-  if (!scheme || !value || scheme.toLowerCase() !== "bearer") return false;
+  const authHeader = request.headers.get('authorization');
+  if (!authHeader) {
+    return false;
+  }
+  const [scheme, value] = authHeader.split(' ');
+  if (!scheme || !value || scheme.toLowerCase() !== 'bearer') {
+    return false;
+  }
 
   return constantTimeEqual(value, token);
 }
@@ -34,11 +40,9 @@ export function authenticate(request: Request): boolean {
  * token so the process refuses to start rather than accepting traffic
  * anonymously.
  */
-export function requireTokenOrThrow(): void {
-  if (process.env.NODE_ENV === "production" && !process.env.KNOLDR_API_TOKEN) {
-    throw new Error(
-      "KNOLDR_API_TOKEN is required in production (fail-closed auth policy)",
-    );
+function requireTokenOrThrow(): void {
+  if (process.env.NODE_ENV === 'production' && !process.env.KNOLDR_API_TOKEN) {
+    throw new Error('KNOLDR_API_TOKEN is required in production (fail-closed auth policy)');
   }
 }
 
@@ -47,8 +51,8 @@ function constantTimeEqual(a: string, b: string): boolean {
   // equal lengths) still runs in constant time. The length comparison at
   // the end keeps mismatched-length inputs as "not equal" without leaking
   // byte-level info about the real token.
-  const aBuf = Buffer.from(a, "utf8");
-  const bBuf = Buffer.from(b, "utf8");
+  const aBuf = Buffer.from(a, 'utf8');
+  const bBuf = Buffer.from(b, 'utf8');
   const len = Math.max(aBuf.length, bBuf.length);
   const aPad = Buffer.alloc(len);
   const bPad = Buffer.alloc(len);
@@ -57,3 +61,5 @@ function constantTimeEqual(a: string, b: string): boolean {
   const eq = timingSafeEqual(aPad, bPad);
   return eq && aBuf.length === bBuf.length;
 }
+
+export { authenticate, requireTokenOrThrow };

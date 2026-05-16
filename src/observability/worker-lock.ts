@@ -1,5 +1,5 @@
-import { getPgClient } from "../db/connection";
-import { logger } from "./logger";
+import { getPgClient } from '../db/connection';
+import { logger } from './logger';
 
 /**
  * Postgres advisory-lock based mutex for cluster-wide singleton
@@ -30,17 +30,14 @@ function keyFor(name: string): bigint {
   return h >= signMask ? h - (1n << 64n) : h;
 }
 
-export async function withClusterLock<T>(
-  name: string,
-  fn: () => Promise<T>,
-): Promise<T | null> {
+export async function withClusterLock<T>(name: string, fn: () => Promise<T>): Promise<T | null> {
   const key = keyFor(name).toString();
   const client = getPgClient();
   const reserved = await client.reserve();
   try {
     const rows = await reserved<Array<{ ok: boolean }>>`SELECT pg_try_advisory_lock(${key}::bigint) AS ok`;
     if (!rows[0]?.ok) {
-      logger.debug({ worker: name }, "advisory lock busy, skipping tick");
+      logger.debug({ worker: name }, 'advisory lock busy, skipping tick');
       return null;
     }
     try {
@@ -49,10 +46,7 @@ export async function withClusterLock<T>(
       try {
         await reserved`SELECT pg_advisory_unlock(${key}::bigint)`;
       } catch (err) {
-        logger.warn(
-          { worker: name, error: (err as Error).message },
-          "advisory lock release failed",
-        );
+        logger.warn({ worker: name, error: (err as Error).message }, 'advisory lock release failed');
       }
     }
   } finally {

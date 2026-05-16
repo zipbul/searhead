@@ -1,40 +1,48 @@
-import postgres from "postgres";
-import { logger } from "../observability/logger";
+// Migration runner.
+//
+// The schema baseline + the kebab-conversion are both expressed as
+// SQL migration files under `drizzle/`, applied here via drizzle's
+// migrator (`__drizzle_migrations` tracks the journal; each file
+// runs once per deployment). Only the work the migrator does not
+// own lives in this script:
+//
+//  - dynamic partition creation: `entry_${year}` tables get added
+//    at runtime per current year + 1, so they cannot live in a
+//    static `.sql` file.
+//
+// Everything else — extensions, table DDL, indexes (including
+// HNSW / pgroonga), CHECK constraints, snake → kebab data
+// rewrites, legacy auto-named CHECK cleanup — is in `drizzle/`.
+
+import { drizzle } from 'drizzle-orm/postgres-js';
+import { migrate as drizzleMigrate } from 'drizzle-orm/postgres-js/migrator';
+import postgres from 'postgres';
+
+import { logger } from '../observability/logger';
+import * as schema from './schema';
 
 const connectionString = process.env.DATABASE_URL;
 if (!connectionString) {
-  throw new Error("DATABASE_URL environment variable is required");
+  throw new Error('DATABASE_URL environment variable is required');
 }
 
 const sql = postgres(connectionString, { max: 1 });
+const db = drizzle(sql, { schema });
 
 async function migrate() {
-  logger.info("running migrations");
+  logger.info('running migrations');
 
-  // Extensions
-  await sql`CREATE EXTENSION IF NOT EXISTS vector`;
-  await sql`CREATE EXTENSION IF NOT EXISTS pgroonga`;
+  await drizzleMigrate(db, { migrationsFolder: './drizzle' });
 
-  // ============================================================
-  // entry (partitioned by created_at)
-  // ============================================================
-  await sql`
-    CREATE TABLE IF NOT EXISTS entry (
-      id TEXT NOT NULL,
-      title TEXT NOT NULL CHECK (length(title) <= 500),
-      content TEXT NOT NULL CHECK (length(content) <= 50000),
-      language TEXT NOT NULL DEFAULT 'en',
-      metadata JSONB CHECK (pg_column_size(metadata) <= 1048576),
-      authority DOUBLE PRECISION NOT NULL DEFAULT 0.0 CHECK (authority >= 0 AND authority <= 1),
-      decay_rate DOUBLE PRECISION NOT NULL DEFAULT 0.01 CHECK (decay_rate >= 0 AND decay_rate <= 1),
-      status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'active')),
-      created_at TIMESTAMPTZ NOT NULL,
-      embedding vector(384) NOT NULL,
-      PRIMARY KEY (id, created_at)
-    ) PARTITION BY RANGE (created_at)
-  `;
-
-  // Partitions
+  // Dynamic year-keyed partitions for the `entry` table. New years
+  // are added eagerly each year; old years' tables remain in place.
+  //
+  // We use `sql.unsafe` here because PostgreSQL's `PARTITION OF ...
+  // FOR VALUES FROM (...) TO (...)` clause does not accept bound
+  // parameters — every value in the FOR VALUES list must be a
+  // compile-time literal. The interpolated values are both derived
+  // from `new Date().getFullYear()`, so they are integers under our
+  // control and carry no injection surface.
   const currentYear = new Date().getFullYear();
   for (let year = 2025; year <= currentYear + 1; year++) {
     const partName = `entry_${year}`;
@@ -44,295 +52,13 @@ async function migrate() {
     `);
   }
 
-  // entry indexes
-  await sql`CREATE INDEX IF NOT EXISTS idx_entry_fulltext ON entry USING pgroonga(title, content)`;
-  await sql`CREATE INDEX IF NOT EXISTS idx_entry_status ON entry(status)`;
-  await sql`CREATE INDEX IF NOT EXISTS idx_entry_authority ON entry(authority DESC)`;
-  await sql`CREATE INDEX IF NOT EXISTS idx_entry_language ON entry(language)`;
-  await sql`CREATE INDEX IF NOT EXISTS idx_entry_created_at ON entry(created_at DESC)`;
-  // HNSW on embedding — without this, dedup and cross-ref run Seq Scan on
-  // every ingest and every smoke-eval cycle. Required for O(log N)
-  // approximate-nearest-neighbor search.
-  await sql`CREATE INDEX IF NOT EXISTS idx_entry_embedding ON entry USING hnsw(embedding vector_cosine_ops)`;
-
-  // ============================================================
-  // entry_domain
-  // ============================================================
-  await sql`
-    CREATE TABLE IF NOT EXISTS entry_domain (
-      entry_id TEXT NOT NULL,
-      entry_created_at TIMESTAMPTZ NOT NULL,
-      domain TEXT NOT NULL CHECK (length(domain) <= 50),
-      PRIMARY KEY (entry_id, entry_created_at, domain),
-      FOREIGN KEY (entry_id, entry_created_at) REFERENCES entry(id, created_at) ON DELETE CASCADE
-    )
-  `;
-  await sql`CREATE INDEX IF NOT EXISTS idx_entry_domain_domain ON entry_domain(domain)`;
-
-  // ============================================================
-  // entry_tag
-  // ============================================================
-  await sql`
-    CREATE TABLE IF NOT EXISTS entry_tag (
-      entry_id TEXT NOT NULL,
-      entry_created_at TIMESTAMPTZ NOT NULL,
-      tag TEXT NOT NULL CHECK (length(tag) <= 50),
-      PRIMARY KEY (entry_id, entry_created_at, tag),
-      FOREIGN KEY (entry_id, entry_created_at) REFERENCES entry(id, created_at) ON DELETE CASCADE
-    )
-  `;
-  await sql`CREATE INDEX IF NOT EXISTS idx_entry_tag_tag ON entry_tag(tag)`;
-
-  // ============================================================
-  // entry_source
-  // ============================================================
-  await sql`
-    CREATE TABLE IF NOT EXISTS entry_source (
-      entry_id TEXT NOT NULL,
-      entry_created_at TIMESTAMPTZ NOT NULL,
-      url TEXT NOT NULL,
-      source_type TEXT NOT NULL,
-      trust DOUBLE PRECISION NOT NULL DEFAULT 0.0 CHECK (trust >= 0 AND trust <= 1),
-      PRIMARY KEY (entry_id, entry_created_at, url),
-      FOREIGN KEY (entry_id, entry_created_at) REFERENCES entry(id, created_at) ON DELETE CASCADE
-    )
-  `;
-  await sql`CREATE INDEX IF NOT EXISTS idx_entry_source_type ON entry_source(source_type)`;
-
-  // ============================================================
-  // ingest_log
-  // ============================================================
-  await sql`
-    CREATE TABLE IF NOT EXISTS ingest_log (
-      id TEXT PRIMARY KEY,
-      url_hash TEXT,
-      entry_id TEXT,
-      entry_created_at TIMESTAMPTZ,
-      action TEXT NOT NULL CHECK (action IN ('stored', 'duplicate', 'rejected')),
-      reason TEXT,
-      ingested_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    )
-  `;
-  await sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_ingest_log_url_hash ON ingest_log(url_hash) WHERE url_hash IS NOT NULL`;
-  await sql`CREATE INDEX IF NOT EXISTS idx_ingest_log_ingested_at ON ingest_log(ingested_at DESC)`;
-
-  // ============================================================
-  // feedback_log
-  // ============================================================
-  await sql`
-    CREATE TABLE IF NOT EXISTS feedback_log (
-      id TEXT PRIMARY KEY,
-      entry_id TEXT NOT NULL,
-      entry_created_at TIMESTAMPTZ NOT NULL,
-      signal TEXT NOT NULL CHECK (signal IN ('positive', 'negative')),
-      reason TEXT,
-      agent_id TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      FOREIGN KEY (entry_id, entry_created_at) REFERENCES entry(id, created_at) ON DELETE CASCADE
-    )
-  `;
-  await sql`CREATE INDEX IF NOT EXISTS idx_feedback_log_entry ON feedback_log(entry_id, created_at DESC)`;
-  await sql`CREATE INDEX IF NOT EXISTS idx_feedback_log_agent_entry ON feedback_log(agent_id, entry_id, created_at DESC)`;
-
-  // ============================================================
-  // retry_queue
-  // ============================================================
-  await sql`
-    CREATE TABLE IF NOT EXISTS retry_queue (
-      id TEXT PRIMARY KEY,
-      raw_content TEXT NOT NULL,
-      source_url TEXT,
-      error_reason TEXT,
-      attempts INTEGER NOT NULL DEFAULT 0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      next_retry_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    )
-  `;
-  await sql`CREATE INDEX IF NOT EXISTS idx_retry_queue_next ON retry_queue(next_retry_at) WHERE attempts < 3`;
-
-  // Drop obsolete table from prior crawler architecture
-  await sql`DROP TABLE IF EXISTS crawl_domain`;
-
-  // ============================================================
-  // claim (v0.3) — atomic assertions extracted from entries
-  // ============================================================
-  await sql`
-    CREATE TABLE IF NOT EXISTS claim (
-      id TEXT PRIMARY KEY,
-      entry_id TEXT NOT NULL,
-      entry_created_at TIMESTAMPTZ NOT NULL,
-      statement TEXT NOT NULL CHECK (length(statement) <= 2000),
-      type TEXT NOT NULL CHECK (type IN ('factual', 'subjective', 'predictive', 'normative')),
-      verdict TEXT NOT NULL DEFAULT 'unverified'
-        CHECK (verdict IN ('verified', 'disputed', 'unverified', 'not_applicable')),
-      certainty DOUBLE PRECISION NOT NULL DEFAULT 0.0 CHECK (certainty >= 0 AND certainty <= 1),
-      evidence JSONB,
-      embedding vector(384) NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      FOREIGN KEY (entry_id, entry_created_at)
-        REFERENCES entry(id, created_at) ON DELETE CASCADE
-    )
-  `;
-  await sql`CREATE INDEX IF NOT EXISTS idx_claim_entry ON claim(entry_id, entry_created_at)`;
-  await sql`CREATE INDEX IF NOT EXISTS idx_claim_type_verdict ON claim(type, verdict)`;
-  await sql`CREATE INDEX IF NOT EXISTS idx_claim_embedding ON claim USING hnsw(embedding vector_cosine_ops)`;
-  // Drift checker uses this to avoid re-picking the same 5 oldest
-  // claims every cycle when they consistently fail to re-verify.
-  await sql`ALTER TABLE claim ADD COLUMN IF NOT EXISTS last_drift_check_at TIMESTAMPTZ`;
-  await sql`CREATE INDEX IF NOT EXISTS idx_claim_drift ON claim(last_drift_check_at NULLS FIRST) WHERE verdict IN ('verified', 'disputed')`;
-
-  // ============================================================
-  // verdict_log — append-only history of every verdict change
-  // ============================================================
-  await sql`
-    CREATE TABLE IF NOT EXISTS verdict_log (
-      id TEXT PRIMARY KEY,
-      claim_id TEXT NOT NULL REFERENCES claim(id) ON DELETE CASCADE,
-      verdict TEXT NOT NULL CHECK (verdict IN ('verified', 'disputed', 'unverified', 'not_applicable')),
-      certainty DOUBLE PRECISION NOT NULL CHECK (certainty >= 0 AND certainty <= 1),
-      evidence_source TEXT,
-      grounder_model TEXT,
-      trigger TEXT NOT NULL CHECK (trigger IN ('auto', 'feedback', 'drift', 'reverify', 'cove', 'manual')),
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    )
-  `;
-  await sql`CREATE INDEX IF NOT EXISTS idx_verdict_log_claim ON verdict_log(claim_id, created_at DESC)`;
-  await sql`CREATE INDEX IF NOT EXISTS idx_verdict_log_created ON verdict_log(created_at DESC)`;
-
-  // ============================================================
-  // verify_queue (v0.3)
-  // ============================================================
-  await sql`
-    CREATE TABLE IF NOT EXISTS verify_queue (
-      claim_id TEXT PRIMARY KEY REFERENCES claim(id) ON DELETE CASCADE,
-      queued_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      priority INTEGER NOT NULL DEFAULT 0,
-      attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0 AND attempts <= 3),
-      next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    )
-  `;
-  // CHECK clamps attempts at 3 so bumpAttempt can't runaway past the
-  // WHERE-filter cutoff. Any pre-existing rows beyond 3 get the verdict
-  // committed + dequeued by the sweep below.
-  await sql`DO $$ BEGIN
-    IF NOT EXISTS (
-      SELECT 1 FROM pg_constraint
-      WHERE conname = 'verify_queue_attempts_check'
-    ) THEN
-      BEGIN
-        ALTER TABLE verify_queue ADD CONSTRAINT verify_queue_attempts_check
-          CHECK (attempts >= 0 AND attempts <= 3);
-      EXCEPTION WHEN check_violation THEN
-        -- Pre-existing data violates; caller should run the sweep then retry.
-        NULL;
-      END;
-    END IF;
-  END $$`;
-  // One-time sweep: anything past attempts=3 is committed as unverified
-  // + dropped from the queue so legacy poison rows don't linger.
-  await sql`
-    WITH stuck AS (
-      SELECT claim_id FROM verify_queue WHERE attempts > 3
-    )
-    UPDATE claim SET verdict = 'unverified', certainty = 0,
-      evidence = COALESCE(evidence, '{}'::jsonb)
-        || jsonb_build_object('source', 'llm_jury', 'rationale', 'legacy stuck row swept')
-    WHERE id IN (SELECT claim_id FROM stuck)
-      AND verdict = 'unverified'
-  `;
-  await sql`DELETE FROM verify_queue WHERE attempts > 3`;
-  await sql`CREATE INDEX IF NOT EXISTS idx_verify_queue_next ON verify_queue(priority DESC, next_attempt_at) WHERE attempts < 3`;
-
-  // ============================================================
-  // entry_score (v0.3) — per-entry derived dimensions
-  // ============================================================
-  await sql`
-    CREATE TABLE IF NOT EXISTS entry_score (
-      entry_id TEXT NOT NULL,
-      entry_created_at TIMESTAMPTZ NOT NULL,
-      dimension TEXT NOT NULL CHECK (dimension IN ('factuality', 'novelty', 'actionability', 'signal')),
-      value DOUBLE PRECISION NOT NULL CHECK (value >= 0 AND value <= 1),
-      scored_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      scored_by TEXT NOT NULL DEFAULT 'system',
-      PRIMARY KEY (entry_id, entry_created_at, dimension),
-      FOREIGN KEY (entry_id, entry_created_at)
-        REFERENCES entry(id, created_at) ON DELETE CASCADE
-    )
-  `;
-  await sql`CREATE INDEX IF NOT EXISTS idx_entry_score_dimension ON entry_score(dimension, value)`;
-
-  // ============================================================
-  // entity (v0.4) — Knowledge Graph nodes
-  // ============================================================
-  await sql`
-    CREATE TABLE IF NOT EXISTS entity (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL CHECK (length(name) <= 200),
-      type TEXT NOT NULL CHECK (length(type) <= 50),
-      aliases TEXT[] NOT NULL DEFAULT '{}',
-      metadata JSONB,
-      embedding vector(384) NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    )
-  `;
-  await sql`CREATE INDEX IF NOT EXISTS idx_entity_name ON entity(name)`;
-  await sql`CREATE INDEX IF NOT EXISTS idx_entity_type ON entity(type)`;
-  await sql`CREATE INDEX IF NOT EXISTS idx_entity_embedding ON entity USING hnsw(embedding vector_cosine_ops)`;
-  // Case-insensitive UNIQUE on (type, lower(name)) — DB-level guard
-  // against race-condition duplicates from upsertEntity.
-  await sql`CREATE UNIQUE INDEX IF NOT EXISTS uniq_entity_type_name_ci ON entity(type, lower(name))`;
-  // Expression index used by isFunctionalPredicate / findConflictingObjects.
-  await sql`CREATE INDEX IF NOT EXISTS idx_entity_name_lower ON entity(lower(name))`;
-
-  // ============================================================
-  // kg_relation (v0.4) — Knowledge Graph edges
-  // ============================================================
-  await sql`
-    CREATE TABLE IF NOT EXISTS kg_relation (
-      id TEXT PRIMARY KEY,
-      source_entity_id TEXT NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
-      target_entity_id TEXT NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
-      relation_type TEXT NOT NULL,
-      claim_id TEXT REFERENCES claim(id) ON DELETE SET NULL,
-      weight DOUBLE PRECISION NOT NULL DEFAULT 1.0 CHECK (weight >= 0 AND weight <= 1),
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      CHECK (source_entity_id <> target_entity_id),
-      UNIQUE (source_entity_id, target_entity_id, relation_type, claim_id)
-    )
-  `;
-  await sql`CREATE INDEX IF NOT EXISTS idx_kg_relation_source ON kg_relation(source_entity_id)`;
-  await sql`CREATE INDEX IF NOT EXISTS idx_kg_relation_target ON kg_relation(target_entity_id)`;
-  // Used by isFunctionalPredicate / findConflictingObjects — without it
-  // every contradiction check Seq Scans the full edge table.
-  await sql`CREATE INDEX IF NOT EXISTS idx_kg_relation_type ON kg_relation(relation_type)`;
-
-  // No human-review queue. The verifier auto-escalates uncertain
-  // cases through CoVe + web_search + specialized retrieval and
-  // commits whatever the strongest available signal indicates,
-  // preferring low-certainty over a deferred decision.
-
-  // ============================================================
-  // calibration_state (v0.5) — auto-calibrated thresholds. A
-  // single-row table updated by the calibration worker; verify
-  // pipeline reads on each batch.
-  // ============================================================
-  await sql`
-    CREATE TABLE IF NOT EXISTS calibration_state (
-      id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-      nli_support_threshold DOUBLE PRECISION NOT NULL DEFAULT 0.7,
-      nli_refute_threshold DOUBLE PRECISION NOT NULL DEFAULT 0.7,
-      sample_size INTEGER NOT NULL DEFAULT 0,
-      best_f1 DOUBLE PRECISION NOT NULL DEFAULT 0,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    )
-  `;
-  await sql`INSERT INTO calibration_state (id) VALUES (1) ON CONFLICT (id) DO NOTHING`;
-
-  logger.info("migrations complete");
+  logger.info('migrations complete');
   await sql.end();
 }
 
-migrate().catch((err) => {
-  logger.error(err, "migration failed");
+try {
+  await migrate();
+} catch (err) {
+  logger.error(err, 'migration failed');
   process.exit(1);
-});
+}

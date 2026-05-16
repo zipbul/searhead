@@ -1,6 +1,7 @@
-import { z } from "zod/v4";
-import { callLlm, extractJson } from "../llm/cli";
-import { logger } from "../observability/logger";
+import { z } from 'zod/v4';
+
+import { callLlm, extractJson } from '../llm/cli';
+import { logger } from '../observability/logger';
 
 // Chain-of-Verification (Dhuliawala et al. 2023, Meta).
 //
@@ -18,9 +19,7 @@ import { logger } from "../observability/logger";
 // inputs return [] — no factual subcomponent to verify.
 
 const decompositionSchema = z.object({
-  subclaims: z
-    .array(z.string().min(1).max(500))
-    .max(6),
+  subclaims: z.array(z.string().min(1).max(500)).max(6),
 });
 
 const SYSTEM_PROMPT = `You decompose a factual claim into atomic sub-claims.
@@ -61,7 +60,9 @@ export async function decomposeClaim(statement: string): Promise<string[]> {
     });
     const raw = extractJson(output);
     const parsed = decompositionSchema.parse(raw);
-    if (parsed.subclaims.length === 0) return [];
+    if (parsed.subclaims.length === 0) {
+      return [];
+    }
     // Filter out sub-claims that are nearly identical to the parent —
     // those add cost without adding signal.
     const original = statement.trim().toLowerCase();
@@ -69,19 +70,22 @@ export async function decomposeClaim(statement: string): Promise<string[]> {
     const unique: string[] = [];
     for (const raw of parsed.subclaims) {
       const s = raw.trim();
-      if (s.length === 0) continue;
-      const key = s.toLowerCase().replace(/\s+/g, " ");
-      if (key === original) continue;
-      if (seen.has(key)) continue;
+      if (s.length === 0) {
+        continue;
+      }
+      const key = s.toLowerCase().replace(/\s+/g, ' ');
+      if (key === original) {
+        continue;
+      }
+      if (seen.has(key)) {
+        continue;
+      }
       seen.add(key);
       unique.push(s);
     }
     return unique;
   } catch (err) {
-    logger.warn(
-      { error: (err as Error).message, statement: statement.slice(0, 100) },
-      "CoVe decomposition failed",
-    );
+    logger.warn({ error: (err as Error).message, statement: statement.slice(0, 100) }, 'CoVe decomposition failed');
     return [];
   }
 }

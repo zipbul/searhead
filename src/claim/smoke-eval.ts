@@ -1,8 +1,9 @@
-import { sql } from "drizzle-orm";
-import { db } from "../db/connection";
-import { verifyClaim } from "./verify";
-import { logger } from "../observability/logger";
-import { invariantOrphans } from "../observability/metrics";
+import { sql } from 'drizzle-orm';
+
+import { getDb } from '../db/connection';
+import { logger } from '../observability/logger';
+import { invariantOrphans } from '../observability/metrics';
+import { verifyClaim } from './verify';
 
 // Smoke evaluation.
 //
@@ -19,7 +20,7 @@ const SAMPLE_SIZE = 20;
 
 interface SampleRow {
   id: string;
-  verdict: "verified" | "disputed";
+  verdict: 'verified' | 'disputed';
   certainty: number;
   source: string;
 }
@@ -37,12 +38,12 @@ export async function runSmokeEval(): Promise<{
   // Instead, filter to a recent window and apply a hash-based sample
   // using tableoid + ctid so each run picks a different but bounded
   // subset without sorting the whole table.
-  const anchors = (await db.execute(sql`
+  const anchors = (await getDb().execute(sql`
     SELECT id, verdict, certainty, evidence->>'source' AS source
     FROM claim
     WHERE verdict IN ('verified', 'disputed')
       AND certainty >= 0.8
-      AND evidence->>'source' = 'source_check'
+      AND evidence->>'source' = 'source-check'
       AND created_at > NOW() - INTERVAL '30 days'
       AND abs(hashtext(id || to_char(now(), 'YYYY-MM-DD HH24'))) % 20 = 0
     LIMIT ${SAMPLE_SIZE}
@@ -57,7 +58,9 @@ export async function runSmokeEval(): Promise<{
   for (const a of anchors) {
     try {
       const fresh = await verifyClaim(a.id);
-      if (!fresh) continue;
+      if (!fresh) {
+        continue;
+      }
       if (fresh.verdict === a.verdict) {
         matched++;
       } else {
@@ -71,21 +74,15 @@ export async function runSmokeEval(): Promise<{
             freshCertainty: fresh.certainty,
             source: a.source,
           },
-          "smoke eval: verdict diverged on anchor",
+          'smoke eval: verdict diverged on anchor',
         );
       }
     } catch (err) {
-      logger.debug(
-        { claimId: a.id, error: (err as Error).message },
-        "smoke eval: anchor reverify failed",
-      );
+      logger.debug({ claimId: a.id, error: (err as Error).message }, 'smoke eval: anchor reverify failed');
     }
   }
 
-  invariantOrphans.set({ check: "smoke_eval_diverged" }, diverged);
-  logger.info(
-    { sampled: anchors.length, matched, diverged },
-    "smoke eval cycle complete",
-  );
+  invariantOrphans.set({ check: 'smoke_eval_diverged' }, diverged);
+  logger.info({ sampled: anchors.length, matched, diverged }, 'smoke eval cycle complete');
   return { sampled: anchors.length, matched, diverged };
 }

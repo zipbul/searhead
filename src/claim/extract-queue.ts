@@ -1,9 +1,10 @@
-import { sql } from "drizzle-orm";
-import { db } from "../db/connection";
-import { extractClaims } from "./extract";
-import { storeClaims } from "./store";
-import { priorityForEntry } from "./verify";
-import { logger } from "../observability/logger";
+import { sql } from 'drizzle-orm';
+
+import { getDb } from '../db/connection';
+import { logger } from '../observability/logger';
+import { extractClaims } from './extract';
+import { storeClaims } from './store';
+import { priorityForEntry } from './verify';
 
 /**
  * Claim extraction runs out-of-band relative to ingest. This processor
@@ -13,7 +14,7 @@ import { logger } from "../observability/logger";
  * second would otherwise spawn 20 parallel CLI subprocesses).
  */
 export async function processClaimExtractionQueue(batchSize = 3): Promise<number> {
-  const rows = await db.execute(sql`
+  const rows = await getDb().execute(sql`
     SELECT e.id, e.title, e.content, e.created_at
     FROM entry e
     WHERE e.status = 'active'
@@ -34,7 +35,9 @@ export async function processClaimExtractionQueue(batchSize = 3): Promise<number
     created_at: Date | string;
   }>;
 
-  if (batch.length === 0) return 0;
+  if (batch.length === 0) {
+    return 0;
+  }
 
   let processed = 0;
   for (const row of batch) {
@@ -42,23 +45,19 @@ export async function processClaimExtractionQueue(batchSize = 3): Promise<number
     try {
       const extracted = await extractClaims(row.title, row.content);
       if (extracted.length === 0) {
-        logger.debug({ entryId: row.id }, "claim extraction returned empty");
+        logger.debug({ entryId: row.id }, 'claim extraction returned empty');
         continue;
       }
       const priority = await priorityForEntry(row.id, createdAt);
       await storeClaims(row.id, createdAt, extracted, priority);
       processed++;
     } catch (err) {
-      logger.warn(
-        { entryId: row.id, error: (err as Error).message },
-        "claim extraction failed",
-      );
+      logger.warn({ entryId: row.id, error: (err as Error).message }, 'claim extraction failed');
     }
   }
 
   if (processed > 0) {
-    logger.info({ processed, batchSize }, "claim extraction batch processed");
+    logger.info({ processed, batchSize }, 'claim extraction batch processed');
   }
   return processed;
 }
-

@@ -1,12 +1,12 @@
-import { logger } from "../observability/logger";
+import { logger } from '../observability/logger';
 
 // Self-hosted SearXNG meta-search. Aggregates Google/Bing/DuckDuckGo +
 // GitHub/arXiv/Wikipedia and returns dedup'd results. JSON API.
-const SEARXNG_URL = process.env.SEARXNG_URL ?? "http://searxng:8080";
+const SEARXNG_URL = process.env.SEARXNG_URL ?? 'http://searxng:8080';
 const SEARCH_TIMEOUT_MS = 6000;
 const MAX_RESULTS = 8;
 
-export interface WebSearchResult {
+interface WebSearchResult {
   url: string;
   title: string;
   snippet: string;
@@ -24,37 +24,39 @@ export interface WebSearchResult {
  * query yielded *worse* recall in practice because the rewrite
  * dropped distinctive entity names.
  */
-export async function webSearch(claim: string): Promise<WebSearchResult[]> {
+async function webSearch(claim: string): Promise<WebSearchResult[]> {
   const ctrl = AbortSignal.timeout(SEARCH_TIMEOUT_MS);
   const url = `${SEARXNG_URL}/search?${new URLSearchParams({
     q: claim,
-    format: "json",
-    safesearch: "0",
+    format: 'json',
+    safesearch: '0',
   })}`;
 
   try {
-    const res = await fetch(url, { signal: ctrl, headers: { accept: "application/json" } });
+    const res = await fetch(url, { signal: ctrl, headers: { accept: 'application/json' } });
     if (!res.ok) {
-      logger.warn({ status: res.status }, "searxng search failed");
+      logger.warn({ status: res.status }, 'searxng search failed');
       return [];
     }
-    const json = (await res.json()) as { results?: Array<{
-      url: string;
-      title?: string;
-      content?: string;
-      engine?: string;
-    }> };
+    const json = (await res.json()) as {
+      results?: Array<{
+        url: string;
+        title?: string;
+        content?: string;
+        engine?: string;
+      }>;
+    };
     const results = json.results ?? [];
     return dedupByDomain(results)
       .slice(0, MAX_RESULTS)
-      .map((r) => ({
+      .map(r => ({
         url: r.url,
-        title: r.title ?? "",
-        snippet: r.content ?? "",
+        title: r.title ?? '',
+        snippet: r.content ?? '',
         engine: r.engine,
       }));
   } catch (err) {
-    logger.debug({ error: (err as Error).message }, "web search error");
+    logger.debug({ error: (err as Error).message }, 'web search error');
     return [];
   }
 }
@@ -69,8 +71,10 @@ function dedupByDomain<T extends { url: string }>(items: T[]): T[] {
   const out: T[] = [];
   for (const item of items) {
     try {
-      const host = new URL(item.url).hostname.replace(/^www\./, "");
-      if (seen.has(host)) continue;
+      const host = new URL(item.url).hostname.replace(/^www\./, '');
+      if (seen.has(host)) {
+        continue;
+      }
       seen.add(host);
       out.push(item);
     } catch {
@@ -79,3 +83,5 @@ function dedupByDomain<T extends { url: string }>(items: T[]): T[] {
   }
   return out;
 }
+
+export { webSearch };

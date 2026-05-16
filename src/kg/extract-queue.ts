@@ -1,8 +1,9 @@
-import { sql } from "drizzle-orm";
-import { db } from "../db/connection";
-import { extractTriples } from "./extract";
-import { storeTriples } from "./store";
-import { logger } from "../observability/logger";
+import { sql } from 'drizzle-orm';
+
+import { getDb } from '../db/connection';
+import { logger } from '../observability/logger';
+import { extractTriples } from './extract';
+import { storeTriples } from './store';
 
 /**
  * KG triple extraction worker.
@@ -21,7 +22,7 @@ import { logger } from "../observability/logger";
  */
 const MIN_KG_CERTAINTY = Number(process.env.KNOLDR_KG_MIN_CERTAINTY ?? 0.5);
 export async function processKgExtractionQueue(batchSize = 3): Promise<number> {
-  const rows = await db.execute(sql`
+  const rows = await getDb().execute(sql`
     SELECT c.id, c.statement, c.verdict, c.certainty
     FROM claim c
     WHERE c.type = 'factual'
@@ -43,34 +44,33 @@ export async function processKgExtractionQueue(batchSize = 3): Promise<number> {
     verdict: string;
     certainty: number;
   }>;
-  if (batch.length === 0) return 0;
+  if (batch.length === 0) {
+    return 0;
+  }
 
   let processed = 0;
   for (const row of batch) {
     try {
       const triples = await extractTriples(row.statement);
       if (triples.length === 0) {
-        logger.debug({ claimId: row.id }, "no triples extracted");
+        logger.debug({ claimId: row.id }, 'no triples extracted');
         continue;
       }
       // Weight = certainty discounted by verdict. Verified claims keep
       // full weight; unverified claims land at half. Downstream
       // consumers (KG contradiction check, expansion) can threshold
       // on this directly.
-      const verdictFactor = row.verdict === "verified" ? 1.0 : 0.5;
+      const verdictFactor = row.verdict === 'verified' ? 1.0 : 0.5;
       const weight = Math.max(0, Math.min(1, row.certainty * verdictFactor));
       await storeTriples(row.id, triples, weight);
       processed++;
     } catch (err) {
-      logger.warn(
-        { claimId: row.id, error: (err as Error).message },
-        "KG extraction failed",
-      );
+      logger.warn({ claimId: row.id, error: (err as Error).message }, 'KG extraction failed');
     }
   }
 
   if (processed > 0) {
-    logger.info({ processed, batchSize }, "KG extraction batch processed");
+    logger.info({ processed, batchSize }, 'KG extraction batch processed');
   }
   return processed;
 }

@@ -5,8 +5,15 @@
     {
       "idx": 0,
       "version": "7",
-      "when": 1777106503535,
-      "tag": "0000_tan_greymalkin",
+      "when": 1778950882061,
+      "tag": "0000_init",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1778951000000,
+      "tag": "0001_kebab_cleanup",
       "breakpoints": true
     }
   ]

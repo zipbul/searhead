@@ -1,9 +1,10 @@
-import { describe, test, expect } from "bun:test";
-import { decodeUlidTimestamp } from "../../src/lib/ulid-utils";
-import { ulid } from "ulid";
+import { describe, test, expect } from 'bun:test';
+import { ulid } from 'ulid';
 
-describe("decodeUlidTimestamp", () => {
-  test("decodes ULID to timestamp within 1ms of now", () => {
+import { decodeUlidTimestamp } from '../../src/lib/ulid-utils';
+
+describe('decodeUlidTimestamp', () => {
+  test('decodes ULID to timestamp within 1ms of now', () => {
     const before = Date.now();
     const id = ulid();
     const after = Date.now();
@@ -13,7 +14,7 @@ describe("decodeUlidTimestamp", () => {
     expect(decoded).toBeLessThanOrEqual(after);
   });
 
-  test("decodes ULID with specific timestamp", () => {
+  test('decodes ULID with specific timestamp', () => {
     // Generate ULID with known timestamp
     const knownTime = 1700000000000; // 2023-11-14
     const id = ulid(knownTime);
@@ -21,7 +22,7 @@ describe("decodeUlidTimestamp", () => {
     expect(decoded).toBe(knownTime);
   });
 
-  test("preserves ordering (newer ULID → larger timestamp)", () => {
+  test('preserves ordering (newer ULID → larger timestamp)', () => {
     const id1 = ulid();
     // tiny delay to ensure different timestamp
     const id2 = ulid(Date.now() + 1000);
@@ -29,14 +30,14 @@ describe("decodeUlidTimestamp", () => {
     expect(decodeUlidTimestamp(id2)).toBeGreaterThan(decodeUlidTimestamp(id1));
   });
 
-  test("handles lowercase ULID", () => {
+  test('handles lowercase ULID', () => {
     const id = ulid();
     const upper = decodeUlidTimestamp(id);
     const lower = decodeUlidTimestamp(id.toLowerCase());
     expect(upper).toBe(lower);
   });
 
-  test("returns a valid Date-compatible timestamp", () => {
+  test('returns a valid Date-compatible timestamp', () => {
     const id = ulid();
     const ts = decodeUlidTimestamp(id);
     const date = new Date(ts);

@@ -4,7 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile.postgres
     ports:
-      - "${KNOLDR_DB_PORT:-5432}:5432"
+      - '${KNOLDR_DB_PORT:-5432}:5432'
     environment:
       POSTGRES_USER: knoldr
       POSTGRES_PASSWORD: knoldr
@@ -12,7 +12,7 @@ services:
     volumes:
       - knoldr-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U knoldr"]
+      test: ['CMD-SHELL', 'pg_isready -U knoldr']
       interval: 5s
       timeout: 3s
       retries: 5
@@ -20,21 +20,21 @@ services:
   app:
     build: .
     ports:
-      - "${KNOLDR_PORT:-5100}:5100"
+      - '${KNOLDR_PORT:-5100}:5100'
     environment:
       DATABASE_URL: postgres://knoldr:knoldr@db:5432/knoldr
-      KNOLDR_PORT: "5100"
-      KNOLDR_HOST: "0.0.0.0"
-      KNOLDR_LOG_LEVEL: "${KNOLDR_LOG_LEVEL:-info}"
-      KNOLDR_API_TOKEN: "${KNOLDR_API_TOKEN:-}"
-      LANGSEARCH_API_KEY: "${LANGSEARCH_API_KEY:-}"
+      KNOLDR_PORT: '5100'
+      KNOLDR_HOST: '0.0.0.0'
+      KNOLDR_LOG_LEVEL: '${KNOLDR_LOG_LEVEL:-info}'
+      KNOLDR_API_TOKEN: '${KNOLDR_API_TOKEN:-}'
+      LANGSEARCH_API_KEY: '${LANGSEARCH_API_KEY:-}'
       # Local Ollama on the host. host.docker.internal maps to the
       # WSL host gateway via extra_hosts below — Linux Docker doesn't
       # resolve it automatically the way Docker Desktop does.
-      OLLAMA_HOST: "${OLLAMA_HOST:-http://host.docker.internal:11434}"
-      KNOLDR_OLLAMA_FAST_MODEL: "${KNOLDR_OLLAMA_FAST_MODEL:-gemma4:e4b}"
-      KNOLDR_OLLAMA_JURY_MODELS: "${KNOLDR_OLLAMA_JURY_MODELS:-gemma4:e4b,qwen2.5:14b}"
-      KNOLDR_OLLAMA_TIMEOUT_MS: "${KNOLDR_OLLAMA_TIMEOUT_MS:-120000}"
+      OLLAMA_HOST: '${OLLAMA_HOST:-http://host.docker.internal:11434}'
+      KNOLDR_OLLAMA_FAST_MODEL: '${KNOLDR_OLLAMA_FAST_MODEL:-gemma4:e4b}'
+      KNOLDR_OLLAMA_JURY_MODELS: '${KNOLDR_OLLAMA_JURY_MODELS:-gemma4:e4b,qwen2.5:14b}'
+      KNOLDR_OLLAMA_TIMEOUT_MS: '${KNOLDR_OLLAMA_TIMEOUT_MS:-120000}'
       # Cap onnxruntime per-op threads to prevent NLI / reranker /
       # embedding model forwards from saturating every core. We set
       # this at three layers because onnxruntime uses whichever
@@ -44,16 +44,16 @@ services:
       #   - OMP_NUM_THREADS / OPENBLAS_NUM_THREADS / MKL_NUM_THREADS:
       #     OS-level cap respected by native ORT + BLAS backends
       #   - ORT_INTRA_OP_NUM_THREADS: onnxruntime-node's own limit
-      KNOLDR_ONNX_THREADS: "${KNOLDR_ONNX_THREADS:-4}"
-      OMP_NUM_THREADS: "${OMP_NUM_THREADS:-4}"
-      OPENBLAS_NUM_THREADS: "${OPENBLAS_NUM_THREADS:-4}"
-      MKL_NUM_THREADS: "${MKL_NUM_THREADS:-4}"
-      ORT_INTRA_OP_NUM_THREADS: "${ORT_INTRA_OP_NUM_THREADS:-4}"
+      KNOLDR_ONNX_THREADS: '${KNOLDR_ONNX_THREADS:-4}'
+      OMP_NUM_THREADS: '${OMP_NUM_THREADS:-4}'
+      OPENBLAS_NUM_THREADS: '${OPENBLAS_NUM_THREADS:-4}'
+      MKL_NUM_THREADS: '${MKL_NUM_THREADS:-4}'
+      ORT_INTRA_OP_NUM_THREADS: '${ORT_INTRA_OP_NUM_THREADS:-4}'
       # Self-hosted SearXNG meta-search for web_search fallback when
       # an entry has no usable cited sources.
-      SEARXNG_URL: "${SEARXNG_URL:-http://searxng:8080}"
+      SEARXNG_URL: '${SEARXNG_URL:-http://searxng:8080}'
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - 'host.docker.internal:host-gateway'
     depends_on:
       db:
         condition: service_healthy
@@ -77,7 +77,7 @@ services:
       context: .
       dockerfile: Dockerfile.postgres
     ports:
-      - "${KNOLDR_TEST_DB_PORT:-5433}:5432"
+      - '${KNOLDR_TEST_DB_PORT:-5433}:5432'
     environment:
       POSTGRES_USER: knoldr
       POSTGRES_PASSWORD: knoldr
@@ -85,7 +85,7 @@ services:
     tmpfs:
       - /var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U knoldr"]
+      test: ['CMD-SHELL', 'pg_isready -U knoldr']
       interval: 5s
       timeout: 3s
       retries: 5
@@ -104,11 +104,11 @@ services:
       context: ./finetune
     environment:
       DATABASE_URL: postgres://knoldr:knoldr@db:5432/knoldr
-      OLLAMA_HOST: "http://host.docker.internal:11434"
-      KNOLDR_FT_GGUF_OUT: "/ollama-models/knoldr"
-      KNOLDR_FT_INTERVAL_HOURS: "${KNOLDR_FT_INTERVAL_HOURS:-24}"
-      KNOLDR_FT_MIN_SAMPLES: "${KNOLDR_FT_MIN_SAMPLES:-200}"
-      KNOLDR_FT_FORCE_NOW: "${KNOLDR_FT_FORCE_NOW:-0}"
+      OLLAMA_HOST: 'http://host.docker.internal:11434'
+      KNOLDR_FT_GGUF_OUT: '/ollama-models/knoldr'
+      KNOLDR_FT_INTERVAL_HOURS: '${KNOLDR_FT_INTERVAL_HOURS:-24}'
+      KNOLDR_FT_MIN_SAMPLES: '${KNOLDR_FT_MIN_SAMPLES:-200}'
+      KNOLDR_FT_FORCE_NOW: '${KNOLDR_FT_FORCE_NOW:-0}'
       # Disable torch.compile / inductor JIT. unsloth invokes triton
       # codegen for fused kernels which then asks gcc to compile a
       # cuda_utils.c shim against libcuda.so.1; the link succeeds in
@@ -116,10 +116,10 @@ services:
       # unclear, likely sysconfig-deps mismatch in the WSL CUDA stack).
       # LoRA training at max_steps=600 doesn't need fused kernels — we
       # accept the unsloth slowdown to keep the chain unblocked.
-      TORCHDYNAMO_DISABLE: "1"
-      TORCH_COMPILE_DISABLE: "1"
+      TORCHDYNAMO_DISABLE: '1'
+      TORCH_COMPILE_DISABLE: '1'
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - 'host.docker.internal:host-gateway'
     volumes:
       - /home/revil/.ollama/models:/ollama-models
     restart: unless-stopped
@@ -141,8 +141,8 @@ services:
       context: .
       dockerfile: Dockerfile.searxng
     environment:
-      BASE_URL: "http://searxng:8080/"
-      INSTANCE_NAME: "knoldr-searxng"
+      BASE_URL: 'http://searxng:8080/'
+      INSTANCE_NAME: 'knoldr-searxng'
     cap_add:
       - CHOWN
       - SETGID

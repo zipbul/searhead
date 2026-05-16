@@ -1,4 +1,4 @@
-import { logger } from "../observability/logger";
+import { logger } from '../observability/logger';
 
 // Specialized retrieval routing.
 //
@@ -21,7 +21,7 @@ interface RetrievalHit {
   url: string;
   title: string;
   snippet: string;
-  source: "github" | "arxiv";
+  source: 'github' | 'arxiv';
 }
 
 const CODE_PATTERNS = [
@@ -39,19 +39,29 @@ const PAPER_PATTERNS = [
   /\b\d{4}\.\d{4,5}\b/, // arXiv-style ID
 ];
 
-export function classifyClaim(statement: string): Array<"code" | "paper"> {
-  const tags: Array<"code" | "paper"> = [];
-  if (CODE_PATTERNS.some((re) => re.test(statement))) tags.push("code");
-  if (PAPER_PATTERNS.some((re) => re.test(statement))) tags.push("paper");
+function classifyClaim(statement: string): Array<'code' | 'paper'> {
+  const tags: Array<'code' | 'paper'> = [];
+  if (CODE_PATTERNS.some(re => re.test(statement))) {
+    tags.push('code');
+  }
+  if (PAPER_PATTERNS.some(re => re.test(statement))) {
+    tags.push('paper');
+  }
   return tags;
 }
 
-export async function getSpecializedHits(statement: string): Promise<RetrievalHit[]> {
+async function getSpecializedHits(statement: string): Promise<RetrievalHit[]> {
   const tags = classifyClaim(statement);
-  if (tags.length === 0) return [];
+  if (tags.length === 0) {
+    return [];
+  }
   const out: RetrievalHit[] = [];
-  if (tags.includes("code")) out.push(...(await searchGithub(statement)));
-  if (tags.includes("paper")) out.push(...(await searchArxiv(statement)));
+  if (tags.includes('code')) {
+    out.push(...(await searchGithub(statement)));
+  }
+  if (tags.includes('paper')) {
+    out.push(...(await searchArxiv(statement)));
+  }
   return out;
 }
 
@@ -59,31 +69,37 @@ async function searchGithub(query: string): Promise<RetrievalHit[]> {
   const ctrl = AbortSignal.timeout(FETCH_TIMEOUT_MS);
   const url = `https://api.github.com/search/repositories?${new URLSearchParams({
     q: query.slice(0, 200),
-    sort: "stars",
-    order: "desc",
-    per_page: "3",
+    sort: 'stars',
+    order: 'desc',
+    per_page: '3',
   })}`;
   try {
     const headers: Record<string, string> = {
-      accept: "application/vnd.github+json",
-      "user-agent": "knoldr-verifier/0.3",
+      accept: 'application/vnd.github+json',
+      'user-agent': 'knoldr-verifier/0.3',
     };
-    if (process.env.GITHUB_TOKEN) headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+    if (process.env.GITHUB_TOKEN) {
+      headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+    }
     const res = await fetch(url, { signal: ctrl, headers });
-    if (!res.ok) return [];
-    const json = (await res.json()) as { items?: Array<{
-      html_url: string;
-      full_name: string;
-      description?: string;
-    }> };
-    return (json.items ?? []).slice(0, 3).map((r) => ({
+    if (!res.ok) {
+      return [];
+    }
+    const json = (await res.json()) as {
+      items?: Array<{
+        html_url: string;
+        full_name: string;
+        description?: string;
+      }>;
+    };
+    return (json.items ?? []).slice(0, 3).map(r => ({
       url: r.html_url,
       title: r.full_name,
-      snippet: r.description ?? "",
-      source: "github" as const,
+      snippet: r.description ?? '',
+      source: 'github' as const,
     }));
   } catch (err) {
-    logger.debug({ error: (err as Error).message }, "github search failed");
+    logger.debug({ error: (err as Error).message }, 'github search failed');
     return [];
   }
 }
@@ -94,27 +110,33 @@ async function searchArxiv(query: string): Promise<RetrievalHit[]> {
   // regex for our needs (title + summary + abs URL).
   const url = `https://export.arxiv.org/api/query?${new URLSearchParams({
     search_query: `all:${query.slice(0, 200)}`,
-    start: "0",
-    max_results: "3",
+    start: '0',
+    max_results: '3',
   })}`;
   try {
     const res = await fetch(url, { signal: ctrl });
-    if (!res.ok) return [];
+    if (!res.ok) {
+      return [];
+    }
     const xml = await res.text();
-    const entries = xml.split("<entry>").slice(1, 4);
-    return entries.map((entry) => {
-      const linkMatch = entry.match(/<id>([^<]+)<\/id>/);
-      const titleMatch = entry.match(/<title>([\s\S]*?)<\/title>/);
-      const summaryMatch = entry.match(/<summary>([\s\S]*?)<\/summary>/);
-      return {
-        url: linkMatch?.[1]?.trim() ?? "",
-        title: (titleMatch?.[1] ?? "").trim().replace(/\s+/g, " "),
-        snippet: (summaryMatch?.[1] ?? "").trim().replace(/\s+/g, " ").slice(0, 500),
-        source: "arxiv" as const,
-      };
-    }).filter((h) => h.url);
+    const entries = xml.split('<entry>').slice(1, 4);
+    return entries
+      .map(entry => {
+        const linkMatch = entry.match(/<id>([^<]+)<\/id>/);
+        const titleMatch = entry.match(/<title>([\s\S]*?)<\/title>/);
+        const summaryMatch = entry.match(/<summary>([\s\S]*?)<\/summary>/);
+        return {
+          url: linkMatch?.[1]?.trim() ?? '',
+          title: (titleMatch?.[1] ?? '').trim().replace(/\s+/g, ' '),
+          snippet: (summaryMatch?.[1] ?? '').trim().replace(/\s+/g, ' ').slice(0, 500),
+          source: 'arxiv' as const,
+        };
+      })
+      .filter(h => h.url);
   } catch (err) {
-    logger.debug({ error: (err as Error).message }, "arxiv search failed");
+    logger.debug({ error: (err as Error).message }, 'arxiv search failed');
     return [];
   }
 }
+
+export { getSpecializedHits };

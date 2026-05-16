@@ -1,0 +1,43 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+
+  // Prettier-compatible core options
+  "printWidth": 130,
+  "tabWidth": 2,
+  "useTabs": false,
+  "semi": true,
+  "singleQuote": true,
+  "jsxSingleQuote": false,
+  "quoteProps": "as-needed",
+  "trailingComma": "all",
+  "bracketSpacing": true,
+  "bracketSameLine": false,
+  "arrowParens": "avoid",
+  "proseWrap": "preserve",
+  "embeddedLanguageFormatting": "auto",
+  "endOfLine": "lf",
+  "insertFinalNewline": true,
+  "ignorePatterns": [],
+  "experimentalSortPackageJson": {
+    "sortScripts": true,
+  },
+  "experimentalSortImports": {
+    "customGroups": [],
+    "groups": [
+      "type-import",
+      ["value-builtin", "value-external"],
+      "type-internal",
+      "value-internal",
+      ["type-parent", "type-sibling", "type-index"],
+      ["value-parent", "value-sibling", "value-index"],
+      "unknown",
+    ],
+    "ignoreCase": true,
+    "internalPattern": ["~/", "@/"],
+    "newlinesBetween": true,
+    "order": "asc",
+    "partitionByComment": false,
+    "partitionByNewline": false,
+    "sortSideEffects": false,
+  },
+}

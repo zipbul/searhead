@@ -50,10 +50,11 @@ export function sanitizeSource(text: string): { cleaned: string; injected: boole
   let injected = false;
   let cleaned = text;
   for (const pattern of INJECTION_PATTERNS) {
-    cleaned = cleaned.replace(pattern, () => {
+    const next = cleaned.replace(pattern, '[REDACTED]');
+    if (next !== cleaned) {
       injected = true;
-      return "[REDACTED]";
-    });
+    }
+    cleaned = next;
   }
   return { cleaned, injected };
 }

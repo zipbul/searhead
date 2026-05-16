@@ -20,11 +20,13 @@
 let configured = false;
 
 export async function configureOnnxRuntime(): Promise<void> {
-  if (configured) return;
+  if (configured) {
+    return;
+  }
   configured = true;
   const threads = Math.max(1, Number(process.env.KNOLDR_ONNX_THREADS ?? 2));
   try {
-    const mod = (await import("@huggingface/transformers")) as unknown as {
+    const mod = (await import('@huggingface/transformers')) as unknown as {
       env?: {
         backends?: { onnx?: { wasm?: { numThreads?: number; proxy?: boolean } } };
       };

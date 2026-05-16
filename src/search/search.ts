@@ -1,12 +1,15 @@
-import { db } from "../db/connection";
-import { entry, entryDomain, entryTag, entrySource } from "../db/schema";
-import { sql, eq, and, gte, inArray, type SQL } from "drizzle-orm";
-import { rank, type RawRow, type ScoredEntry, type ScoreBreakdown } from "./rank";
-import type { QueryInput, ExploreInput } from "../ingest/validate";
-import { logger } from "../observability/logger";
-import { searchTotal, searchLatency } from "../observability/metrics";
+import { sql, eq, and, gte, inArray, type SQL } from 'drizzle-orm';
 
-export interface SearchResult {
+import type { QueryInput, ExploreInput } from '../ingest/validate';
+
+import { getDb } from '../db/connection';
+import { entry, entryDomain, entryTag, entrySource } from '../db/schema';
+import { logger } from '../observability/logger';
+import { searchTotal, searchLatency } from '../observability/metrics';
+import { SortBy } from '../score/enums';
+import { rank, type RawRow, type ScoredEntry, type ScoreBreakdown } from './rank';
+
+interface SearchResult {
   entries: ScoredEntry[];
   scores: ScoreBreakdown[];
   trustLevels: string[];
@@ -33,11 +36,11 @@ const CANDIDATE_MULTIPLIER = 3;
 /**
  * Keyword search with pgroonga FTS, filters, freshness decay, authority ranking.
  */
-export async function search(input: QueryInput): Promise<SearchResult> {
+async function search(input: QueryInput): Promise<SearchResult> {
   const timer = searchLatency.startTimer();
   searchTotal.inc();
   try {
-    const conditions: SQL[] = [eq(entry.status, "active")];
+    const conditions: SQL[] = [eq(entry.status, 'active')];
 
     if (input.minAuthority !== undefined) {
       conditions.push(gte(entry.authority, input.minAuthority));
@@ -51,12 +54,13 @@ export async function search(input: QueryInput): Promise<SearchResult> {
 
     // pgroonga FTS — escape special chars then OR-join so a raw apostrophe /
     // brace / pipe in the user query can't corrupt pgroonga's grammar.
-    const queryTerms = input.query.trim().split(/\s+/).filter((t) => t.length > 0);
+    const queryTerms = input.query
+      .trim()
+      .split(/\s+/)
+      .filter(t => t.length > 0);
     const escaped = queryTerms.map(escapePgroongaTerm);
-    const orQuery = escaped.length > 0 ? escaped.join(" OR ") : escaped[0] ?? "";
-    conditions.push(
-      sql`(${entry.title} &@~ ${orQuery} OR ${entry.content} &@~ ${orQuery})`,
-    );
+    const orQuery = escaped.length > 0 ? escaped.join(' OR ') : (escaped[0] ?? '');
+    conditions.push(sql`(${entry.title} &@~ ${orQuery} OR ${entry.content} &@~ ${orQuery})`);
 
     // Domain filter
     if (input.domain) {
@@ -77,7 +81,7 @@ export async function search(input: QueryInput): Promise<SearchResult> {
     // work without defeating pagination. `cursor` handles going deeper.
     const fetchLimit = Math.max(limit * CANDIDATE_MULTIPLIER, 20);
 
-    const rows = await db
+    const rows = await getDb()
       .select({
         id: entry.id,
         title: entry.title,
@@ -96,20 +100,20 @@ export async function search(input: QueryInput): Promise<SearchResult> {
       .limit(fetchLimit);
 
     const enriched = await enrichRows(rows);
-    const ranked = rank(enriched, "query", queryTerms);
+    const ranked = rank(enriched, 'query', queryTerms);
 
     return slicePage(ranked, input.cursor, limit);
   } finally {
     timer();
-    logger.info({ query: input.query }, "search completed");
+    logger.info({ query: input.query }, 'search completed');
   }
 }
 
 /**
  * Filter-only browsing (empty query). No pgroonga FTS.
  */
-export async function explore(input: ExploreInput): Promise<SearchResult> {
-  const conditions: SQL[] = [eq(entry.status, "active")];
+async function explore(input: ExploreInput): Promise<SearchResult> {
+  const conditions: SQL[] = [eq(entry.status, 'active')];
 
   if (input.minAuthority !== undefined) {
     conditions.push(gte(entry.authority, input.minAuthority));
@@ -130,25 +134,21 @@ export async function explore(input: ExploreInput): Promise<SearchResult> {
 
   const limit = Math.min(input.limit, MAX_LIMIT);
   const fetchLimit = Math.max(limit * CANDIDATE_MULTIPLIER, 20);
-  const sortColumn = input.sortBy === "created_at" ? entry.createdAt : entry.authority;
+  const sortColumn = input.sortBy === SortBy.CreatedAt ? entry.createdAt : entry.authority;
 
   // For explore we push cursor filtering into the SQL itself — the pool
   // is large and the composite (authority, id) or (created_at, id)
   // index delivers O(log N) keyset pagination.
   const decoded = input.cursor ? decodeCursor(input.cursor) : null;
   if (decoded) {
-    if (input.sortBy === "created_at") {
-      conditions.push(
-        sql`(EXTRACT(EPOCH FROM ${entry.createdAt}), ${entry.id}) < (${decoded.score}, ${decoded.id})`,
-      );
+    if (input.sortBy === SortBy.CreatedAt) {
+      conditions.push(sql`(EXTRACT(EPOCH FROM ${entry.createdAt}), ${entry.id}) < (${decoded.score}, ${decoded.id})`);
     } else {
-      conditions.push(
-        sql`(${entry.authority}, ${entry.id}) < (${decoded.score}, ${decoded.id})`,
-      );
+      conditions.push(sql`(${entry.authority}, ${entry.id}) < (${decoded.score}, ${decoded.id})`);
     }
   }
 
-  const rows = await db
+  const rows = await getDb()
     .select({
       id: entry.id,
       title: entry.title,
@@ -167,7 +167,7 @@ export async function explore(input: ExploreInput): Promise<SearchResult> {
     .limit(fetchLimit);
 
   const enriched = await enrichRows(rows);
-  const ranked = rank(enriched, "explore");
+  const ranked = rank(enriched, 'explore');
 
   // Explore feeds ranking by authority+freshness, so the cursor still
   // uses ranked final score for stability between pages.
@@ -189,11 +189,17 @@ function slicePage(
     // sort key (final desc, id.localeCompare(a,b) desc).
     startIdx = ranked.entries.findIndex((e, i) => {
       const s = ranked.scores[i]!.final;
-      if (s < decoded.score) return true;
-      if (s > decoded.score) return false;
+      if (s < decoded.score) {
+        return true;
+      }
+      if (s > decoded.score) {
+        return false;
+      }
       return e.id.localeCompare(decoded.id) < 0;
     });
-    if (startIdx === -1) startIdx = ranked.entries.length;
+    if (startIdx === -1) {
+      startIdx = ranked.entries.length;
+    }
   }
 
   const sliced = {
@@ -229,21 +235,20 @@ type BaseRow = {
 };
 
 async function enrichRows(rows: BaseRow[]): Promise<RawRow[]> {
-  if (rows.length === 0) return [];
+  if (rows.length === 0) {
+    return [];
+  }
 
-  const ids = rows.map((r) => r.id);
+  const ids = rows.map(r => r.id);
 
   // Batch fetch domains, tags, sources
   const [domains, tags, sources] = await Promise.all([
-    db
+    getDb()
       .select({ entryId: entryDomain.entryId, domain: entryDomain.domain })
       .from(entryDomain)
       .where(inArray(entryDomain.entryId, ids)),
-    db
-      .select({ entryId: entryTag.entryId, tag: entryTag.tag })
-      .from(entryTag)
-      .where(inArray(entryTag.entryId, ids)),
-    db
+    getDb().select({ entryId: entryTag.entryId, tag: entryTag.tag }).from(entryTag).where(inArray(entryTag.entryId, ids)),
+    getDb()
       .select({
         entryId: entrySource.entryId,
         url: entrySource.url,
@@ -276,7 +281,7 @@ async function enrichRows(rows: BaseRow[]): Promise<RawRow[]> {
     sourceMap.set(s.entryId, arr);
   }
 
-  return rows.map((r) => ({
+  return rows.map(r => ({
     ...r,
     domains: domainMap.get(r.id) ?? [],
     tags: tagMap.get(r.id) ?? [],
@@ -286,9 +291,12 @@ async function enrichRows(rows: BaseRow[]): Promise<RawRow[]> {
 
 function trustLevelToMinAuthority(level: string): number {
   switch (level) {
-    case "high": return 0.7;
-    case "medium": return 0.4;
-    default: return 0;
+    case 'high':
+      return 0.7;
+    case 'medium':
+      return 0.4;
+    default:
+      return 0;
   }
 }
 
@@ -300,7 +308,7 @@ function trustLevelToMinAuthority(level: string): number {
  * internal double-quotes are backslash-escaped.
  */
 function escapePgroongaTerm(term: string): string {
-  const escaped = term.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const escaped = term.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   return `"${escaped}"`;
 }
 
@@ -313,9 +321,9 @@ function decodeCursor(cursor: string): Cursor | null {
     const parsed = JSON.parse(atob(cursor));
     if (
       parsed &&
-      typeof parsed === "object" &&
-      typeof (parsed as Cursor).score === "number" &&
-      typeof (parsed as Cursor).id === "string"
+      typeof parsed === 'object' &&
+      typeof (parsed as Cursor).score === 'number' &&
+      typeof (parsed as Cursor).id === 'string'
     ) {
       return parsed as Cursor;
     }
@@ -324,3 +332,6 @@ function decodeCursor(cursor: string): Cursor | null {
     return null;
   }
 }
+
+export { search, explore };
+export type { SearchResult };

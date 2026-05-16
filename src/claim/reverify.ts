@@ -1,8 +1,11 @@
-import { sql, eq, and, lt, or, isNull } from "drizzle-orm";
-import { db } from "../db/connection";
-import { claim } from "../db/schema";
-import { verifyClaim } from "./verify";
-import { logger } from "../observability/logger";
+import { sql, eq, and, lt, or } from 'drizzle-orm';
+
+import { getDb } from '../db/connection';
+import { claim } from '../db/schema';
+import { logger } from '../observability/logger';
+import { Verdict } from '../score/enums';
+import { recordVerdictTransitionSafe } from './authority-learn';
+import { verifyClaim } from './verify';
 
 // Drift detector. A claim verified with confidence today can become
 // disputed tomorrow if the underlying source changes (page edited,
@@ -26,24 +29,49 @@ const REVERIFY_BATCH = 5;
 
 export async function detectDrift(batchSize = REVERIFY_BATCH): Promise<number> {
   const cutoff = new Date(Date.now() - DRIFT_AGE_DAYS * 24 * 3600 * 1000);
+  const now = new Date();
 
-  const due = await db
+  // Selection priority (ORDER BY first key wins):
+  //   1. claim.valid_until has elapsed — the extractor declared this
+  //      claim has a known expiry, and we're past it. Highest-leverage
+  //      reverify target: the world definitely entered a new state
+  //      relative to when this claim was true.
+  //   2. lastDriftCheckAt — oldest first, NULL first for claims never
+  //      checked. Existing cycling behavior.
+  //
+  // Verified + disputed claims older than DRIFT_AGE_DAYS qualify
+  // regardless of which priority axis picks them; the valid_until
+  // gate also relaxes the age cutoff (an expired claim is worth
+  // reverifying even if it was just stored — the extractor's
+  // valid_until is a strong signal about the world's timeline,
+  // not about how long Knoldr has held the row).
+  const due = await getDb()
     .select({
       id: claim.id,
       verdict: claim.verdict,
       certainty: claim.certainty,
       statement: claim.statement,
+      validUntil: claim.validUntil,
     })
     .from(claim)
     .where(
       and(
         sql`${claim.verdict} IN ('verified', 'disputed')`,
-        lt(claim.createdAt, cutoff),
+        // Either the claim is stale enough OR its declared validity
+        // window has elapsed. The OR widens the candidate pool to
+        // expired-validity claims that wouldn't have aged in yet.
+        or(lt(claim.createdAt, cutoff), and(sql`${claim.validUntil} IS NOT NULL`, lt(claim.validUntil, now))!),
       ),
     )
-    // Oldest drift-check-timestamp first, NULL first for claims never
-    // checked. `claim.createdAt` as secondary key keeps order stable.
     .orderBy(
+      // Expired valid_until rows first (validity_expired bit = 1
+      // outranks 0). Ties broken by oldest drift-check timestamp,
+      // NULL first for never-checked rows.
+      sql`CASE
+            WHEN ${claim.validUntil} IS NOT NULL AND ${claim.validUntil} < NOW()
+            THEN 0
+            ELSE 1
+          END`,
       sql`${claim.lastDriftCheckAt} NULLS FIRST`,
       claim.createdAt,
     )
@@ -61,32 +89,37 @@ export async function detectDrift(batchSize = REVERIFY_BATCH): Promise<number> {
       // cycles through the rest of the verified pool.
       const nowTs = new Date();
       if (!fresh) {
-        await db
-          .update(claim)
-          .set({ lastDriftCheckAt: nowTs })
-          .where(eq(claim.id, c.id));
+        await getDb().update(claim).set({ lastDriftCheckAt: nowTs }).where(eq(claim.id, c.id));
         continue;
       }
       if (fresh.verdict === c.verdict) {
-        await db
-          .update(claim)
-          .set({ lastDriftCheckAt: nowTs })
-          .where(eq(claim.id, c.id));
+        await getDb().update(claim).set({ lastDriftCheckAt: nowTs }).where(eq(claim.id, c.id));
         continue;
       }
 
-      const newCertainty =
-        fresh.verdict === "unverified" ? c.certainty * 0.5 : fresh.certainty;
-      await db
+      const newCertainty = fresh.verdict === Verdict.Unverified ? c.certainty * 0.5 : fresh.certainty;
+      // Drift moves the verdict; authority must follow so a claim
+      // that just lost its 'verified' status doesn't keep ranking
+      // as a high-authority retrieval candidate. We resync to the
+      // fresh certainty floor — feedback-driven authority moves
+      // re-accumulate from the new floor as before.
+      await getDb()
         .update(claim)
         .set({
           verdict: fresh.verdict,
           certainty: newCertainty,
+          authority: newCertainty,
           evidence: { ...fresh.evidence, drifted_from: c.verdict },
           lastDriftCheckAt: nowTs,
         })
         .where(eq(claim.id, c.id));
       drifted++;
+      // Drift is the highest-signal verdict transition for feedback
+      // learning — by definition the world (or the model) moved
+      // since the original verdict. Fire the same authority hook
+      // the live verify pipeline uses so reporters who anticipated
+      // this drift get credit and those who got it wrong lose it.
+      recordVerdictTransitionSafe(c.id, c.verdict as Verdict, fresh.verdict);
       logger.info(
         {
           claimId: c.id,
@@ -95,30 +128,22 @@ export async function detectDrift(batchSize = REVERIFY_BATCH): Promise<number> {
           newCertainty,
           statement: c.statement.slice(0, 80),
         },
-        "claim drift detected",
+        'claim drift detected',
       );
     } catch (err) {
-      logger.warn(
-        { claimId: c.id, error: (err as Error).message },
-        "drift reverify failed",
-      );
+      logger.warn({ claimId: c.id, error: (err as Error).message }, 'drift reverify failed');
       // Still stamp the timestamp so a permanently-failing claim stops
       // monopolizing the batch. Retry will cycle back around naturally.
       try {
-        await db
-          .update(claim)
-          .set({ lastDriftCheckAt: new Date() })
-          .where(eq(claim.id, c.id));
-      } catch { /* best-effort */ }
+        await getDb().update(claim).set({ lastDriftCheckAt: new Date() }).where(eq(claim.id, c.id));
+      } catch {
+        /* best-effort */
+      }
     }
   }
 
   if (drifted > 0) {
-    logger.info({ drifted, batchSize }, "drift batch processed");
+    logger.info({ drifted, batchSize }, 'drift batch processed');
   }
   return drifted;
 }
-
-// Exports kept for backwards-compatibility with any imports from other
-// modules.
-export { or, isNull };

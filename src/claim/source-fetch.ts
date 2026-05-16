@@ -1,11 +1,12 @@
-import { JSDOM } from "jsdom";
-import { Readability } from "@mozilla/readability";
-import { resolve as resolve4, resolve6 } from "node:dns/promises";
-import { isIP } from "node:net";
-import { generateEmbedding } from "../ingest/embed";
-import { rerank } from "../llm/reranker";
-import { sanitizeSource } from "./sanitize";
-import { logger } from "../observability/logger";
+import { Readability } from '@mozilla/readability';
+import { JSDOM } from 'jsdom';
+import { resolve as resolve4, resolve6 } from 'node:dns/promises';
+import { isIP } from 'node:net';
+
+import { generateEmbedding } from '../ingest/embed';
+import { rerank } from '../llm/reranker';
+import { logger } from '../observability/logger';
+import { sanitizeSource } from './sanitize';
 
 // Per-fetch budget. Most pages render under 5s; the few that don't
 // (paywalls, JS-only, dead) we'd rather give up on than block the
@@ -15,12 +16,11 @@ const FETCH_TIMEOUT_MS = 8000;
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 
 const USER_AGENT =
-  process.env.KNOLDR_FETCH_USER_AGENT ??
-  "Mozilla/5.0 (compatible; knoldr-verifier/0.3; +https://github.com/parkrevil)";
+  process.env.KNOLDR_FETCH_USER_AGENT ?? 'Mozilla/5.0 (compatible; knoldr-verifier/0.3; +https://github.com/parkrevil)';
 
-export interface FetchedSource {
+interface FetchedSource {
   url: string;
-  status: "ok" | "fetch_failed" | "no_content" | "blocked_type";
+  status: 'ok' | 'fetch_failed' | 'no_content' | 'blocked_type';
   title?: string;
   text?: string;
   byline?: string;
@@ -44,7 +44,9 @@ const inflight = new Map<string, Promise<FetchedSource>>();
 
 function cacheGet(url: string): FetchedSource | null {
   const hit = cache.get(url);
-  if (!hit) return null;
+  if (!hit) {
+    return null;
+  }
   if (Date.now() > hit.expiresAt) {
     cache.delete(url);
     return null;
@@ -59,7 +61,9 @@ function cacheSet(url: string, result: FetchedSource): void {
   cache.set(url, { result, expiresAt: Date.now() + CACHE_TTL_MS });
   while (cache.size > CACHE_MAX_ENTRIES) {
     const oldest = cache.keys().next().value;
-    if (oldest === undefined) break;
+    if (oldest === undefined) {
+      break;
+    }
     cache.delete(oldest);
   }
 }
@@ -71,17 +75,25 @@ function cacheSet(url: string, result: FetchedSource): void {
  * fetch (no thundering herd when a batch verifies many claims that
  * all reference the same authoritative source).
  */
-export async function fetchSource(url: string): Promise<FetchedSource> {
+async function fetchSource(url: string): Promise<FetchedSource> {
   const cached = cacheGet(url);
-  if (cached) return cached;
+  if (cached) {
+    return cached;
+  }
   const inFlight = inflight.get(url);
-  if (inFlight) return inFlight;
+  if (inFlight) {
+    return inFlight;
+  }
 
-  const promise = doFetch(url).then((result) => {
+  // We store the in-flight promise BEFORE awaiting so concurrent callers
+  // see it and dedupe. Each waiter resolves to the same FetchedSource;
+  // the post-fetch cleanup (cache write + dedupe map evict) runs once.
+  const promise = (async () => {
+    const result = await doFetch(url);
     cacheSet(url, result);
     inflight.delete(url);
     return result;
-  });
+  })();
   inflight.set(url, promise);
   return promise;
 }
@@ -95,7 +107,7 @@ async function doFetch(url: string): Promise<FetchedSource> {
   // are re-validated (see manual redirect follow below).
   const guarded = await assertPublicUrl(url);
   if (!guarded.ok) {
-    return { url, status: "fetch_failed", fetchedAt, error: guarded.reason };
+    return { url, status: 'fetch_failed', fetchedAt, error: guarded.reason };
   }
 
   const ctrl = AbortSignal.timeout(FETCH_TIMEOUT_MS);
@@ -108,56 +120,58 @@ async function doFetch(url: string): Promise<FetchedSource> {
     for (let hop = 0; hop < 5; hop++) {
       const check = await assertPublicUrl(current);
       if (!check.ok) {
-        return { url, status: "fetch_failed", fetchedAt, error: check.reason };
+        return { url, status: 'fetch_failed', fetchedAt, error: check.reason };
       }
       res = await fetch(current, {
         signal: ctrl,
-        headers: { "user-agent": USER_AGENT, accept: "text/html,application/xhtml+xml" },
-        redirect: "manual",
+        headers: { 'user-agent': USER_AGENT, accept: 'text/html,application/xhtml+xml' },
+        redirect: 'manual',
       });
       if (res.status >= 300 && res.status < 400) {
-        const loc = res.headers.get("location");
-        if (!loc) break;
+        const loc = res.headers.get('location');
+        if (!loc) {
+          break;
+        }
         current = new URL(loc, current).toString();
         continue;
       }
       break;
     }
     if (!res) {
-      return { url, status: "fetch_failed", fetchedAt, error: "no response" };
+      return { url, status: 'fetch_failed', fetchedAt, error: 'no response' };
     }
 
     if (!res.ok) {
-      return { url, status: "fetch_failed", fetchedAt, error: `HTTP ${res.status}` };
+      return { url, status: 'fetch_failed', fetchedAt, error: `HTTP ${res.status}` };
     }
 
-    const ct = res.headers.get("content-type") ?? "";
+    const ct = res.headers.get('content-type') ?? '';
     if (!/text\/html|application\/xhtml/i.test(ct)) {
       // PDF, plain text, JSON etc. — Readability won't help. Could add
       // pdf.js later; for now treat as unfetchable so NLI returns neutral.
-      return { url, status: "blocked_type", fetchedAt, error: `content-type ${ct}` };
+      return { url, status: 'blocked_type', fetchedAt, error: `content-type ${ct}` };
     }
 
     const buf = await res.arrayBuffer();
     if (buf.byteLength > MAX_BODY_BYTES) {
-      return { url, status: "blocked_type", fetchedAt, error: "body too large" };
+      return { url, status: 'blocked_type', fetchedAt, error: 'body too large' };
     }
-    const html = new TextDecoder("utf-8", { fatal: false }).decode(buf);
+    const html = new TextDecoder('utf-8', { fatal: false }).decode(buf);
 
     const dom = new JSDOM(html, { url });
     const article = new Readability(dom.window.document).parse();
     if (!article || !article.textContent || article.textContent.trim().length < 100) {
-      return { url, status: "no_content", fetchedAt, error: "readability returned empty" };
+      return { url, status: 'no_content', fetchedAt, error: 'readability returned empty' };
     }
 
     const normalized = normalizeWhitespace(article.textContent);
     const sanitized = sanitizeSource(normalized);
     if (sanitized.injected) {
-      logger.warn({ url }, "prompt-injection patterns scrubbed from source");
+      logger.warn({ url }, 'prompt-injection patterns scrubbed from source');
     }
     return {
       url,
-      status: "ok",
+      status: 'ok',
       title: article.title ?? undefined,
       text: sanitized.cleaned,
       byline: article.byline ?? undefined,
@@ -168,13 +182,13 @@ async function doFetch(url: string): Promise<FetchedSource> {
     };
   } catch (err) {
     const msg = (err as Error).message;
-    logger.debug({ url, error: msg }, "source fetch failed");
-    return { url, status: "fetch_failed", fetchedAt, error: msg };
+    logger.debug({ url, error: msg }, 'source fetch failed');
+    return { url, status: 'fetch_failed', fetchedAt, error: msg };
   }
 }
 
 function normalizeWhitespace(s: string): string {
-  return s.replace(/\s+/g, " ").trim();
+  return s.replace(/\s+/g, ' ').trim();
 }
 
 /**
@@ -192,11 +206,11 @@ function normalizeWhitespace(s: string): string {
  * whose content is trusted.
  */
 function getAllowedInternalHosts(): Set<string> {
-  const raw = process.env.KNOLDR_ALLOWED_INTERNAL_HOSTS ?? "";
+  const raw = process.env.KNOLDR_ALLOWED_INTERNAL_HOSTS ?? '';
   return new Set(
     raw
-      .split(",")
-      .map((s) => s.trim().toLowerCase())
+      .split(',')
+      .map(s => s.trim().toLowerCase())
       .filter(Boolean),
   );
 }
@@ -206,17 +220,21 @@ async function assertPublicUrl(raw: string): Promise<{ ok: true } | { ok: false;
   try {
     u = new URL(raw);
   } catch {
-    return { ok: false, reason: "invalid url" };
+    return { ok: false, reason: 'invalid url' };
   }
-  if (u.protocol !== "http:" && u.protocol !== "https:") {
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
     return { ok: false, reason: `disallowed scheme ${u.protocol}` };
   }
-  const host = (u.hostname || "").toLowerCase();
-  if (!host) return { ok: false, reason: "empty host" };
+  const host = (u.hostname || '').toLowerCase();
+  if (!host) {
+    return { ok: false, reason: 'empty host' };
+  }
 
   // Explicit allowlist escape hatch for legitimate intranet sources.
   const allowed = getAllowedInternalHosts();
-  if (allowed.has(host)) return { ok: true };
+  if (allowed.has(host)) {
+    return { ok: true };
+  }
 
   // Resolve (or recognize IP literal) and check every address.
   const ips: string[] = [];
@@ -225,15 +243,23 @@ async function assertPublicUrl(raw: string): Promise<{ ok: true } | { ok: false;
   } else {
     try {
       const [a, aaaa] = await Promise.allSettled([resolve4(host), resolve6(host)]);
-      if (a.status === "fulfilled") ips.push(...a.value);
-      if (aaaa.status === "fulfilled") ips.push(...aaaa.value);
+      if (a.status === 'fulfilled') {
+        ips.push(...a.value);
+      }
+      if (aaaa.status === 'fulfilled') {
+        ips.push(...aaaa.value);
+      }
     } catch {
-      return { ok: false, reason: "dns error" };
+      return { ok: false, reason: 'dns error' };
     }
   }
-  if (ips.length === 0) return { ok: false, reason: "no dns records" };
+  if (ips.length === 0) {
+    return { ok: false, reason: 'no dns records' };
+  }
   for (const ip of ips) {
-    if (isPrivateIp(ip)) return { ok: false, reason: `private ip ${ip}` };
+    if (isPrivateIp(ip)) {
+      return { ok: false, reason: `private ip ${ip}` };
+    }
   }
   return { ok: true };
 }
@@ -241,27 +267,49 @@ async function assertPublicUrl(raw: string): Promise<{ ok: true } | { ok: false;
 function isPrivateIp(ip: string): boolean {
   // IPv6: loopback ::1, link-local fe80::/10, unique-local fc00::/7,
   // IPv4-mapped ::ffff:a.b.c.d, unspecified ::.
-  if (ip.includes(":")) {
+  if (ip.includes(':')) {
     const lower = ip.toLowerCase();
-    if (lower === "::" || lower === "::1") return true;
-    if (lower.startsWith("fe80:") || /^fe[89ab]/.test(lower)) return true;
-    if (/^f[cd]/.test(lower)) return true;
+    if (lower === '::' || lower === '::1') {
+      return true;
+    }
+    if (lower.startsWith('fe80:') || /^fe[89ab]/.test(lower)) {
+      return true;
+    }
+    if (/^f[cd]/.test(lower)) {
+      return true;
+    }
     const mapped = lower.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-    if (mapped) return isPrivateIp(mapped[1]!);
+    if (mapped) {
+      return isPrivateIp(mapped[1]!);
+    }
     return false;
   }
-  const parts = ip.split(".").map(Number);
-  if (parts.length !== 4 || parts.some((p) => Number.isNaN(p) || p < 0 || p > 255)) {
+  const parts = ip.split('.').map(Number);
+  if (parts.length !== 4 || parts.some(p => Number.isNaN(p) || p < 0 || p > 255)) {
     return true; // reject anything we can't parse
   }
   const [a, b] = parts as [number, number, number, number];
-  if (a === 10) return true; // 10/8
-  if (a === 127) return true; // 127/8 loopback
-  if (a === 169 && b === 254) return true; // 169.254/16 link-local (AWS metadata, etc.)
-  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16/12
-  if (a === 192 && b === 168) return true; // 192.168/16
-  if (a === 0) return true; // 0.0.0.0/8 unspecified
-  if (a >= 224) return true; // multicast / reserved
+  if (a === 10) {
+    return true;
+  } // 10/8
+  if (a === 127) {
+    return true;
+  } // 127/8 loopback
+  if (a === 169 && b === 254) {
+    return true;
+  } // 169.254/16 link-local (AWS metadata, etc.)
+  if (a === 172 && b >= 16 && b <= 31) {
+    return true;
+  } // 172.16/12
+  if (a === 192 && b === 168) {
+    return true;
+  } // 192.168/16
+  if (a === 0) {
+    return true;
+  } // 0.0.0.0/8 unspecified
+  if (a >= 224) {
+    return true;
+  } // multicast / reserved
   return false;
 }
 
@@ -277,15 +325,14 @@ function isPrivateIp(ip: string): boolean {
  *      cases that the dual-encoder misranks because both sentences
  *      embed near the same point.
  */
-export async function selectRelevantChunks(
-  text: string,
-  claim: string,
-  topK = 6,
-  chunkChars = 400,
-): Promise<string[]> {
+async function selectRelevantChunks(text: string, claim: string, topK = 6, chunkChars = 400): Promise<string[]> {
   const chunks = chunkBySentences(text, chunkChars);
-  if (chunks.length === 0) return [text];
-  if (chunks.length <= topK) return chunks;
+  if (chunks.length === 0) {
+    return [text];
+  }
+  if (chunks.length <= topK) {
+    return chunks;
+  }
 
   // Stage 1: dual-encoder shortlist — keep top 3×K by cosine.
   const claimVec = await generateEmbedding(claim);
@@ -296,29 +343,31 @@ export async function selectRelevantChunks(
   }
   scored.sort((a, b) => b.score - a.score);
   const shortlistSize = Math.min(scored.length, topK * 3);
-  const shortlist = scored.slice(0, shortlistSize).map((s) => chunks[s.idx]!);
+  const shortlist = scored.slice(0, shortlistSize).map(s => chunks[s.idx]!);
 
   // Stage 2: cross-encoder rerank for claim-conditional relevance.
   const order = await rerank(claim, shortlist);
-  return order.slice(0, topK).map((i) => shortlist[i]!);
+  return order.slice(0, topK).map(i => shortlist[i]!);
 }
 
 function chunkBySentences(text: string, targetChars: number): string[] {
   const sentences = text.split(/(?<=[.!?。!?])\s+/);
   const chunks: string[] = [];
-  let buf = "";
+  let buf = '';
   for (const s of sentences) {
     if (buf.length + s.length + 1 > targetChars && buf.length > 0) {
       chunks.push(buf);
-      buf = "";
+      buf = '';
     }
     buf = buf ? `${buf} ${s}` : s;
     if (buf.length >= targetChars) {
       chunks.push(buf);
-      buf = "";
+      buf = '';
     }
   }
-  if (buf) chunks.push(buf);
+  if (buf) {
+    chunks.push(buf);
+  }
   return chunks;
 }
 
@@ -334,3 +383,6 @@ function cosine(a: number[], b: number[]): number {
   const denom = Math.sqrt(na) * Math.sqrt(nb);
   return denom > 0 ? dot / denom : 0;
 }
+
+export { fetchSource, selectRelevantChunks };
+export type { FetchedSource };

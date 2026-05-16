@@ -15,18 +15,20 @@
 const SHINGLE_LEN = 8;
 const HASH_BITS = 64;
 
-export interface SourceFingerprint {
+interface SourceFingerprint {
   url: string;
   domain: string;
   titleNorm: string;
   simhash: bigint;
 }
 
-export function fingerprint(url: string, title: string, text: string): SourceFingerprint {
-  let domain = "";
+function fingerprint(url: string, title: string, text: string): SourceFingerprint {
+  let domain = '';
   try {
-    domain = new URL(url).hostname.toLowerCase().replace(/^www\./, "");
-  } catch { /* malformed URL */ }
+    domain = new URL(url).hostname.toLowerCase().replace(/^www\./, '');
+  } catch {
+    /* malformed URL */
+  }
   return {
     url,
     domain,
@@ -35,49 +37,11 @@ export function fingerprint(url: string, title: string, text: string): SourceFin
   };
 }
 
-/**
- * Group fingerprints into independence buckets. Two fingerprints
- * collapse if any of: same domain, same normalized title, hamming
- * distance < 4 on simhash. Uses union-find so similarity is
- * transitive — A~B and B~C imply A~C even when A and C aren't
- * directly similar (catches three-way cascades of Reuters reposts
- * that the per-group-head comparison dropped into separate buckets).
- */
-export function independentCount(fps: SourceFingerprint[]): number {
-  if (fps.length === 0) return 0;
-  const parent = fps.map((_, i) => i);
-  const find = (x: number): number => {
-    while (parent[x] !== x) {
-      parent[x] = parent[parent[x]!]!;
-      x = parent[x]!;
-    }
-    return x;
-  };
-  const union = (a: number, b: number): void => {
-    const ra = find(a);
-    const rb = find(b);
-    if (ra !== rb) parent[ra] = rb;
-  };
-  for (let i = 0; i < fps.length; i++) {
-    for (let j = i + 1; j < fps.length; j++) {
-      const fi = fps[i]!;
-      const fj = fps[j]!;
-      if (
-        (fi.domain && fi.domain === fj.domain) ||
-        (fi.titleNorm.length > 4 && fi.titleNorm === fj.titleNorm) ||
-        hamming(fi.simhash, fj.simhash) < 4
-      ) {
-        union(i, j);
-      }
-    }
-  }
-  const roots = new Set<number>();
-  for (let i = 0; i < fps.length; i++) roots.add(find(i));
-  return roots.size;
-}
-
 function normalize(s: string): string {
-  return s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  return s
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim();
 }
 
 /**
@@ -86,10 +50,12 @@ function normalize(s: string): string {
  */
 function simhash(text: string): bigint {
   const tokens = text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
-  if (tokens.length < SHINGLE_LEN) return 0n;
+  if (tokens.length < SHINGLE_LEN) {
+    return 0n;
+  }
   const counts = new Array<number>(HASH_BITS).fill(0);
   for (let i = 0; i <= tokens.length - SHINGLE_LEN; i++) {
-    const shingle = tokens.slice(i, i + SHINGLE_LEN).join(" ");
+    const shingle = tokens.slice(i, i + SHINGLE_LEN).join(' ');
     const h = fnv64(shingle);
     for (let b = 0; b < HASH_BITS; b++) {
       const bit = (h >> BigInt(b)) & 1n;
@@ -98,7 +64,9 @@ function simhash(text: string): bigint {
   }
   let out = 0n;
   for (let b = 0; b < HASH_BITS; b++) {
-    if (counts[b]! > 0) out |= 1n << BigInt(b);
+    if (counts[b]! > 0) {
+      out |= 1n << BigInt(b);
+    }
   }
   return out;
 }
@@ -114,12 +82,5 @@ function fnv64(s: string): bigint {
   return h;
 }
 
-function hamming(a: bigint, b: bigint): number {
-  let x = a ^ b;
-  let count = 0;
-  while (x !== 0n) {
-    x &= x - 1n;
-    count++;
-  }
-  return count;
-}
+export { fingerprint };
+export type { SourceFingerprint };

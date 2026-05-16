@@ -4,21 +4,21 @@ use_default_settings: true
 
 general:
   debug: false
-  instance_name: "knoldr-searxng"
+  instance_name: 'knoldr-searxng'
 
 search:
   formats:
     - html
     - json
   safe_search: 0
-  autocomplete: ""
-  default_lang: ""
+  autocomplete: ''
+  default_lang: ''
 
 server:
-  bind_address: "0.0.0.0"
+  bind_address: '0.0.0.0'
   port: 8080
-  secret_key: "knoldr-local-dev-secret-do-not-use-in-public-deployment"
-  base_url: "http://searxng:8080/"
+  secret_key: 'knoldr-local-dev-secret-do-not-use-in-public-deployment'
+  base_url: 'http://searxng:8080/'
   limiter: false
   image_proxy: false
 

@@ -25,7 +25,7 @@ const NEGATION_PATTERNS = [
 ];
 
 export function hasNegation(text: string): boolean {
-  return NEGATION_PATTERNS.some((re) => re.test(text));
+  return NEGATION_PATTERNS.some(re => re.test(text));
 }
 
 /**

@@ -1,10 +1,11 @@
-import { z } from "zod/v4";
-import { callLlm, extractJson } from "../llm/cli";
-import { webSearch } from "./web-search";
-import { fetchSource, selectRelevantChunks } from "./source-fetch";
-import { nliScore } from "../llm/nli";
-import { authorityFor } from "./authority";
-import { logger } from "../observability/logger";
+import { z } from 'zod/v4';
+
+import { callLlm, extractJson } from '../llm/cli';
+import { nliScore } from '../llm/nli';
+import { logger } from '../observability/logger';
+import { authorityFor } from './authority';
+import { fetchSource, selectRelevantChunks } from './source-fetch';
+import { webSearch } from './web-search';
 
 // Counter-evidence search.
 //
@@ -35,7 +36,7 @@ const counterSchema = z.object({ query: z.string().min(1).max(300) });
 const COUNTER_FETCH_LIMIT = 4;
 const REFUTE_THRESHOLD = 0.8;
 
-export interface CounterEvidence {
+interface CounterEvidence {
   url: string;
   authority: number;
   contradiction: number;
@@ -57,22 +58,28 @@ export async function counterSearch(claim: string): Promise<CounterEvidence | nu
     });
     query = counterSchema.parse(extractJson(out)).query;
   } catch (err) {
-    logger.debug({ error: (err as Error).message }, "counter-query generation failed");
+    logger.debug({ error: (err as Error).message }, 'counter-query generation failed');
     return null;
   }
 
   const hits = (await webSearch(query)).slice(0, COUNTER_FETCH_LIMIT);
-  if (hits.length === 0) return null;
+  if (hits.length === 0) {
+    return null;
+  }
 
   let best: CounterEvidence | null = null;
   for (const hit of hits) {
     const fetched = await fetchSource(hit.url);
-    if (fetched.status !== "ok" || !fetched.text) continue;
+    if (fetched.status !== 'ok' || !fetched.text) {
+      continue;
+    }
     const chunks = await selectRelevantChunks(fetched.text, claim, 3);
     let chunkBest = 0;
     for (const c of chunks) {
       const s = await nliScore(c, claim);
-      if (s.contradiction > chunkBest) chunkBest = s.contradiction;
+      if (s.contradiction > chunkBest) {
+        chunkBest = s.contradiction;
+      }
     }
     const authority = authorityFor(hit.url);
     const weighted = chunkBest * authority;
@@ -88,7 +95,7 @@ export async function counterSearch(claim: string): Promise<CounterEvidence | nu
   if (best?.triggered) {
     logger.info(
       { url: best.url, contradiction: best.contradiction, authority: best.authority },
-      "counter-search refuted prior verified",
+      'counter-search refuted prior verified',
     );
   }
   return best;

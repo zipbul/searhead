@@ -1,8 +1,10 @@
-import { db } from "../db/connection";
-import { entry, ingestLog } from "../db/schema";
-import { sql, gt, and, ne, lt } from "drizzle-orm";
-import { ulid } from "ulid";
-import { logger } from "../observability/logger";
+import { sql, gt, and, ne, lt } from 'drizzle-orm';
+import { ulid } from 'ulid';
+
+import { getDb } from '../db/connection';
+import { entry, ingestLog } from '../db/schema';
+import { logger } from '../observability/logger';
+import { IngestAction } from '../score/enums';
 
 const BATCH_SIZE = 100;
 const MAX_DURATION_MS = 30 * 60 * 1000; // 30 minutes
@@ -27,12 +29,12 @@ export async function batchDedup(): Promise<number> {
   let totalDeleted = 0;
   // Cursor: keep advancing by id > lastId instead of OFFSET so deletes
   // can't shift rows out of future batches.
-  let lastId = "";
+  let lastId = '';
 
-  logger.info("batch dedup started");
+  logger.info('batch dedup started');
 
   while (Date.now() - startTime < MAX_DURATION_MS) {
-    const recentEntries = await db
+    const recentEntries = await getDb()
       .select({
         id: entry.id,
         createdAt: entry.createdAt,
@@ -40,27 +42,26 @@ export async function batchDedup(): Promise<number> {
         embedding: entry.embedding,
       })
       .from(entry)
-      .where(
-        and(
-          gt(entry.createdAt, sevenDaysAgo),
-          lastId ? gt(entry.id, lastId) : sql`TRUE`,
-        ),
-      )
+      .where(and(gt(entry.createdAt, sevenDaysAgo), lastId ? gt(entry.id, lastId) : sql`TRUE`))
       .orderBy(entry.id)
       .limit(BATCH_SIZE);
 
-    if (recentEntries.length === 0) break;
+    if (recentEntries.length === 0) {
+      break;
+    }
     lastId = recentEntries[recentEntries.length - 1]!.id;
 
     for (const current of recentEntries) {
-      if (Date.now() - startTime > MAX_DURATION_MS) break;
+      if (Date.now() - startTime > MAX_DURATION_MS) {
+        break;
+      }
 
-      const vecStr = `[${(current.embedding as number[]).join(",")}]`;
+      const vecStr = `[${(current.embedding as number[]).join(',')}]`;
 
       // HNSW-friendly shape: ORDER BY distance LIMIT N. Threshold
       // filter happens in JS so the index doesn't degrade to a Seq
       // Scan on entry-growth.
-      const neighborRows = await db
+      const neighborRows = await getDb()
         .select({
           id: entry.id,
           createdAt: entry.createdAt,
@@ -72,7 +73,7 @@ export async function batchDedup(): Promise<number> {
         .orderBy(sql`${entry.embedding} <=> ${vecStr}::vector`)
         .limit(5);
 
-      const neighbors = neighborRows.filter((n) => n.distance < DISTANCE_THRESHOLD);
+      const neighbors = neighborRows.filter(n => n.distance < DISTANCE_THRESHOLD);
 
       for (const neighbor of neighbors) {
         let deleteId: string;
@@ -100,32 +101,27 @@ export async function batchDedup(): Promise<number> {
           }
         }
 
-        await db.transaction(async (tx) => {
-          await tx
-            .delete(entry)
-            .where(
-              and(
-                sql`${entry.id} = ${deleteId}`,
-                sql`${entry.createdAt} = ${deleteCreatedAt}`,
-              ),
-            );
+        await getDb().transaction(async tx => {
+          await tx.delete(entry).where(and(sql`${entry.id} = ${deleteId}`, sql`${entry.createdAt} = ${deleteCreatedAt}`));
           await tx.insert(ingestLog).values({
             id: ulid(),
             entryId: deleteId,
             entryCreatedAt: deleteCreatedAt,
-            action: "duplicate",
+            action: IngestAction.Duplicate,
             reason: `batch_dedup: similar_to=${keepId}`,
           });
         });
 
         totalDeleted++;
-        logger.debug({ deleted: deleteId, kept: keepId }, "batch dedup: removed duplicate");
+        logger.debug({ deleted: deleteId, kept: keepId }, 'batch dedup: removed duplicate');
 
-        if (deleteId === current.id) break;
+        if (deleteId === current.id) {
+          break;
+        }
       }
     }
   }
 
-  logger.info({ totalDeleted, durationMs: Date.now() - startTime }, "batch dedup completed");
+  logger.info({ totalDeleted, durationMs: Date.now() - startTime }, 'batch dedup completed');
   return totalDeleted;
 }

@@ -1,24 +1,21 @@
 /**
  * Test database helper.
- * Requires a running PostgreSQL with pgvector + pgroonga extensions.
- * Set TEST_DATABASE_URL to use (defaults to knoldr_test database).
+ *
+ * Now delegates schema setup to the actual migration runner (drizzle
+ * migrator + dynamic partition creation in src/db/migrate.ts). The
+ * old helper hand-rolled a simplified schema, which silently drifted
+ * from production and let migration regressions slip past CI. Going
+ * through the real migration path means integration tests now cover
+ * `drizzle/0000_init.sql`, `drizzle/0001_kebab_cleanup.sql`, and the
+ * partition fan-out in one shot.
  */
-import postgres from "postgres";
-import { drizzle } from "drizzle-orm/postgres-js";
-import * as schema from "../../src/db/schema";
+import { drizzle } from 'drizzle-orm/postgres-js';
+import { migrate as drizzleMigrate } from 'drizzle-orm/postgres-js/migrator';
+import postgres from 'postgres';
 
-const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? "postgres://localhost:5432/knoldr_test";
+const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? 'postgres://localhost:5432/knoldr_test';
 
 let _client: ReturnType<typeof postgres> | null = null;
-let _db: ReturnType<typeof drizzle<typeof schema>> | null = null;
-
-export function getTestDb() {
-  if (!_db) {
-    _client = postgres(TEST_DB_URL, { max: 5 });
-    _db = drizzle(_client, { schema });
-  }
-  return _db;
-}
 
 export function getTestClient() {
   if (!_client) {
@@ -27,180 +24,39 @@ export function getTestClient() {
   return _client;
 }
 
-/** Run migrations on test DB */
+/** Run the project migrations on the test database. */
 export async function setupTestDb() {
   const sql = getTestClient();
+  const db = drizzle(sql);
+  await drizzleMigrate(db, { migrationsFolder: './drizzle' });
 
-  await sql`CREATE EXTENSION IF NOT EXISTS vector`;
-  await sql`CREATE EXTENSION IF NOT EXISTS pgroonga`;
-
-  // Create tables (simplified, no partitioning for tests)
-  await sql`
-    CREATE TABLE IF NOT EXISTS entry (
-      id TEXT NOT NULL,
-      title TEXT NOT NULL,
-      content TEXT NOT NULL,
-      language TEXT NOT NULL DEFAULT 'en',
-      metadata JSONB,
-      authority DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-      decay_rate DOUBLE PRECISION NOT NULL DEFAULT 0.01,
-      status TEXT NOT NULL DEFAULT 'draft',
-      created_at TIMESTAMPTZ NOT NULL,
-      embedding vector(384) NOT NULL,
-      PRIMARY KEY (id, created_at)
-    )
-  `;
-
-  await sql`
-    CREATE TABLE IF NOT EXISTS entry_domain (
-      entry_id TEXT NOT NULL,
-      entry_created_at TIMESTAMPTZ NOT NULL,
-      domain TEXT NOT NULL,
-      PRIMARY KEY (entry_id, entry_created_at, domain)
-    )
-  `;
-
-  await sql`
-    CREATE TABLE IF NOT EXISTS entry_tag (
-      entry_id TEXT NOT NULL,
-      entry_created_at TIMESTAMPTZ NOT NULL,
-      tag TEXT NOT NULL,
-      PRIMARY KEY (entry_id, entry_created_at, tag)
-    )
-  `;
-
-  await sql`
-    CREATE TABLE IF NOT EXISTS entry_source (
-      entry_id TEXT NOT NULL,
-      entry_created_at TIMESTAMPTZ NOT NULL,
-      url TEXT NOT NULL,
-      source_type TEXT NOT NULL,
-      trust DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-      PRIMARY KEY (entry_id, entry_created_at, url)
-    )
-  `;
-
-  await sql`
-    CREATE TABLE IF NOT EXISTS ingest_log (
-      id TEXT PRIMARY KEY,
-      url_hash TEXT,
-      entry_id TEXT,
-      entry_created_at TIMESTAMPTZ,
-      action TEXT NOT NULL,
-      reason TEXT,
-      ingested_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    )
-  `;
-
-  await sql`
-    CREATE TABLE IF NOT EXISTS feedback_log (
-      id TEXT PRIMARY KEY,
-      entry_id TEXT NOT NULL,
-      entry_created_at TIMESTAMPTZ NOT NULL,
-      signal TEXT NOT NULL,
-      reason TEXT,
-      agent_id TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    )
-  `;
-
-  await sql`
-    CREATE TABLE IF NOT EXISTS retry_queue (
-      id TEXT PRIMARY KEY,
-      raw_content TEXT NOT NULL,
-      source_url TEXT,
-      error_reason TEXT,
-      attempts INTEGER NOT NULL DEFAULT 0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      next_retry_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    )
-  `;
-
-  // v0.3: claim + verify_queue + entry_score
-  await sql`
-    CREATE TABLE IF NOT EXISTS claim (
-      id TEXT PRIMARY KEY,
-      entry_id TEXT NOT NULL,
-      entry_created_at TIMESTAMPTZ NOT NULL,
-      statement TEXT NOT NULL,
-      type TEXT NOT NULL,
-      verdict TEXT NOT NULL DEFAULT 'unverified',
-      certainty DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-      evidence JSONB,
-      embedding vector(384) NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      FOREIGN KEY (entry_id, entry_created_at)
-        REFERENCES entry(id, created_at) ON DELETE CASCADE
-    )
-  `;
-  await sql`
-    CREATE TABLE IF NOT EXISTS verify_queue (
-      claim_id TEXT PRIMARY KEY REFERENCES claim(id) ON DELETE CASCADE,
-      queued_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      priority INTEGER NOT NULL DEFAULT 0,
-      attempts INTEGER NOT NULL DEFAULT 0,
-      next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    )
-  `;
-  await sql`
-    CREATE TABLE IF NOT EXISTS entry_score (
-      entry_id TEXT NOT NULL,
-      entry_created_at TIMESTAMPTZ NOT NULL,
-      dimension TEXT NOT NULL,
-      value DOUBLE PRECISION NOT NULL,
-      scored_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      scored_by TEXT NOT NULL DEFAULT 'system',
-      PRIMARY KEY (entry_id, entry_created_at, dimension),
-      FOREIGN KEY (entry_id, entry_created_at)
-        REFERENCES entry(id, created_at) ON DELETE CASCADE
-    )
-  `;
-
-  // v0.4: entity + kg_relation
-  await sql`
-    CREATE TABLE IF NOT EXISTS entity (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      type TEXT NOT NULL,
-      aliases TEXT[] NOT NULL DEFAULT '{}',
-      metadata JSONB,
-      embedding vector(384) NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    )
-  `;
-  await sql`
-    CREATE TABLE IF NOT EXISTS kg_relation (
-      id TEXT PRIMARY KEY,
-      source_entity_id TEXT NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
-      target_entity_id TEXT NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
-      relation_type TEXT NOT NULL,
-      claim_id TEXT REFERENCES claim(id) ON DELETE SET NULL,
-      weight DOUBLE PRECISION NOT NULL DEFAULT 1.0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      CHECK (source_entity_id <> target_entity_id),
-      UNIQUE (source_entity_id, target_entity_id, relation_type, claim_id)
-    )
-  `;
-
-  // pgroonga index
-  await sql`CREATE INDEX IF NOT EXISTS idx_entry_fulltext ON entry USING pgroonga(title, content)`;
+  // Mirror src/db/migrate.ts: ensure the current-year + 1 partitions
+  // exist. Without this every INSERT into `entry` fails with "no
+  // partition of relation entry found for row".
+  const currentYear = new Date().getFullYear();
+  for (let year = 2025; year <= currentYear + 1; year++) {
+    const partName = `entry_${year}`;
+    await sql.unsafe(`
+      CREATE TABLE IF NOT EXISTS ${partName} PARTITION OF entry
+        FOR VALUES FROM ('${year}-01-01') TO ('${year + 1}-01-01')
+    `);
+  }
 }
 
-/** Clean all test data */
+/** Truncate every test-touched table so the next test starts clean. */
 export async function cleanTestDb() {
   const sql = getTestClient();
-  await sql`DELETE FROM feedback_log`;
-  await sql`DELETE FROM ingest_log`;
-  await sql`DELETE FROM entry_source`;
-  await sql`DELETE FROM entry_tag`;
-  await sql`DELETE FROM entry_domain`;
-  await sql`DELETE FROM kg_relation`;
-  await sql`DELETE FROM entity`;
-  await sql`DELETE FROM verify_queue`;
-  await sql`DELETE FROM entry_score`;
-  await sql`DELETE FROM claim`;
-  await sql`DELETE FROM retry_queue`;
-  await sql`DELETE FROM entry`;
+  // Order matters only when FK CASCADE chains aren't already on the
+  // tables; every FK here is ON DELETE CASCADE, so a single TRUNCATE
+  // ... CASCADE on `entry` reaches the dependents, but we list each
+  // table to keep the cleanup deterministic regardless of which
+  // tests have data in them.
+  await sql`TRUNCATE
+    feedback_log, ingest_log, entry_source, entry_tag, entry_domain,
+    kg_relation, entity, agent_feedback_authority, claim_feedback,
+    claim_relation, verdict_log, verify_queue, entry_score, claim,
+    retry_queue, entry, golden_set_run, golden_set_claim
+    RESTART IDENTITY CASCADE`;
 }
 
 /** Close test DB connection */
@@ -208,6 +64,5 @@ export async function teardownTestDb() {
   if (_client) {
     await _client.end();
     _client = null;
-    _db = null;
   }
 }

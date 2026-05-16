@@ -1,8 +1,9 @@
-import { z } from "zod/v4";
-import { callLlm, extractJson } from "../llm/cli";
-import { logger } from "../observability/logger";
+import { z } from 'zod/v4';
 
-export interface ChunkMeta {
+import { callLlm, extractJson } from '../llm/cli';
+import { logger } from '../observability/logger';
+
+interface ChunkMeta {
   domain: string[];
   tags: string[];
   decayRate: number;
@@ -10,8 +11,23 @@ export interface ChunkMeta {
 }
 
 const itemSchema = z.object({
-  domain: z.array(z.string().max(50).regex(/^[\p{Ll}\p{Lo}\p{N}-]+$/u)).min(1).max(5),
-  tags: z.array(z.string().max(50).regex(/^[\p{Ll}\p{Lo}\p{N}-]+$/u)).max(10),
+  domain: z
+    .array(
+      z
+        .string()
+        .max(50)
+        .regex(/^[\p{Ll}\p{Lo}\p{N}-]+$/u),
+    )
+    .min(1)
+    .max(5),
+  tags: z
+    .array(
+      z
+        .string()
+        .max(50)
+        .regex(/^[\p{Ll}\p{Lo}\p{N}-]+$/u),
+    )
+    .max(10),
   decayRate: z.number().min(0.0001).max(0.1),
   language: z.string().regex(/^[a-z]{2}$/),
 });
@@ -59,10 +75,10 @@ function batchSizeForModel(): number {
 
 function makeDefaults(topic: string): ChunkMeta {
   return {
-    domain: [slugify(topic.split(/\s+/)[0] ?? "web")],
+    domain: [slugify(topic.split(/\s+/)[0] ?? 'web')],
     tags: [],
     decayRate: 0.01,
-    language: "en",
+    language: 'en',
   };
 }
 
@@ -70,11 +86,10 @@ function makeDefaults(topic: string): ChunkMeta {
  * Classify chunks in batches of BATCH_SIZE. Returns metadata per chunk,
  * with safe defaults where LLM output is missing or unparseable.
  */
-export async function classifyBatch(
-  chunks: Array<{ title: string; text: string }>,
-  topic: string,
-): Promise<ChunkMeta[]> {
-  if (chunks.length === 0) return [];
+async function classifyBatch(chunks: Array<{ title: string; text: string }>, topic: string): Promise<ChunkMeta[]> {
+  if (chunks.length === 0) {
+    return [];
+  }
 
   const defaults = makeDefaults(topic);
   const result: ChunkMeta[] = [];
@@ -94,9 +109,7 @@ async function classifySingleBatch(
   topic: string,
   defaults: ChunkMeta,
 ): Promise<ChunkMeta[]> {
-  const numbered = batch
-    .map((c, i) => `[${i}] ${c.title}\n${c.text.slice(0, 800)}`)
-    .join("\n---\n");
+  const numbered = batch.map((c, i) => `[${i}] ${c.title}\n${c.text.slice(0, 800)}`).join('\n---\n');
 
   const system = `${SYSTEM_PROMPT}\n\nTopic context: ${topic}`;
 
@@ -111,23 +124,24 @@ async function classifySingleBatch(
     // to defaults.
     const byIndex = new Map<number, z.infer<typeof indexedItemSchema>>();
     for (const c of parsed.chunks) {
-      if (c.index >= 0 && c.index < batch.length) byIndex.set(c.index, c);
+      if (c.index >= 0 && c.index < batch.length) {
+        byIndex.set(c.index, c);
+      }
     }
     return batch.map((_, i) => {
       const c = byIndex.get(i);
-      if (!c) return { ...defaults };
+      if (!c) {
+        return { ...defaults };
+      }
       return {
         domain: c.domain.length > 0 ? c.domain : defaults.domain,
         tags: c.tags,
         decayRate: c.decayRate,
-        language: c.language || "en",
+        language: c.language || 'en',
       };
     });
   } catch (err) {
-    logger.warn(
-      { error: (err as Error).message, batchSize: batch.length },
-      "batch classify failed, using defaults",
-    );
+    logger.warn({ error: (err as Error).message, batchSize: batch.length }, 'batch classify failed, using defaults');
     return batch.map(() => ({ ...defaults }));
   }
 }
@@ -135,9 +149,13 @@ async function classifySingleBatch(
 /** Normalize LLM output: slugify domains and tags before Zod validation.
  *  LLMs frequently produce underscores, spaces, dots, or mixed case. */
 function sanitizeBatchOutput(raw: unknown): unknown {
-  if (!raw || typeof raw !== "object") return raw;
+  if (!raw || typeof raw !== 'object') {
+    return raw;
+  }
   const obj = raw as Record<string, unknown>;
-  if (!Array.isArray(obj.chunks)) return raw;
+  if (!Array.isArray(obj.chunks)) {
+    return raw;
+  }
 
   obj.chunks = (obj.chunks as Record<string, unknown>[]).map((chunk, fallbackIdx) => {
     if (Array.isArray(chunk.domain)) {
@@ -150,20 +168,27 @@ function sanitizeBatchOutput(raw: unknown): unknown {
     // so the schema validates. Mapping-by-position is strictly worse than
     // mapping-by-index but we never want to drop a whole batch for a
     // missing field.
-    if (typeof chunk.index !== "number") chunk.index = fallbackIdx;
+    if (typeof chunk.index !== 'number') {
+      chunk.index = fallbackIdx;
+    }
     return chunk;
   });
   return obj;
 }
 
 function slugify(raw: unknown): string {
-  if (typeof raw !== "string") return "";
-  return raw
-    .toLowerCase()
-    .normalize("NFKC")
-    .replace(/[_\s.]+/g, "-")
-    .replace(/[^\p{L}\p{N}-]/gu, "")
-    .replace(/-{2,}/g, "-")
-    .replace(/^-|-$/g, "")
-    || "";
+  if (typeof raw !== 'string') {
+    return '';
+  }
+  return (
+    raw
+      .toLowerCase()
+      .normalize('NFKC')
+      .replace(/[_\s.]+/g, '-')
+      .replace(/[^\p{L}\p{N}-]/gu, '')
+      .replace(/-{2,}/g, '-')
+      .replace(/^-|-$/g, '') || ''
+  );
 }
+
+export { classifyBatch };
