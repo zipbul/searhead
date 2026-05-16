@@ -1,4 +1,5 @@
 import { startServer } from "./a2a/server";
+import { startFqaWorkers } from "./fqa/workers";
 import { logger } from "./observability/logger";
 import { configureOnnxRuntime } from "./llm/onnx-env";
 
@@ -9,3 +10,8 @@ logger.info("knoldr starting");
 await configureOnnxRuntime();
 
 startServer();
+// FQA runs as background workers in the same process — no separate
+// A2A surface. Reporter-driven completion goes through the main
+// `claim_feedback` skill (update mode). Disable entirely with
+// KNOLDR_FQA_WORKERS=0.
+startFqaWorkers();

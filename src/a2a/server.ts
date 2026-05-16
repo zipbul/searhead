@@ -138,6 +138,40 @@ export function startServer() {
     },
   });
 
+  // Partition rollover — daily. Creates next-year's entry partition
+  // when within 30 days of the year boundary. migrate.ts only
+  // pre-creates currentYear+1 at install time; without this worker
+  // a 2026-12-31 production write would fail because no 2027
+  // partition exists. Idempotent CREATE IF NOT EXISTS.
+  setInterval(async () => {
+    await withClusterLock("partition-rollover", async () => {
+      try {
+        const now = new Date();
+        const yearEnd = new Date(Date.UTC(now.getUTCFullYear() + 1, 0, 1));
+        const daysUntilBoundary =
+          (yearEnd.getTime() - now.getTime()) / (24 * 3600 * 1000);
+        if (daysUntilBoundary > 30) return;
+        const { db } = await import("../db/connection");
+        const { sql } = await import("drizzle-orm");
+        const nextYear = now.getUTCFullYear() + 1;
+        const partName = `entry_${nextYear}`;
+        await db.execute(sql.raw(
+          `CREATE TABLE IF NOT EXISTS ${partName} PARTITION OF entry
+             FOR VALUES FROM ('${nextYear}-01-01') TO ('${nextYear + 1}-01-01')`,
+        ));
+        logger.info(
+          { partName, daysUntilBoundary: Math.round(daysUntilBoundary) },
+          "next-year partition ensured",
+        );
+      } catch (err) {
+        logger.error(
+          { error: (err as Error).message },
+          "partition rollover failed",
+        );
+      }
+    });
+  }, 24 * 3600 * 1000); // daily
+
   // Batch dedup job — daily at UTC 03:00.
   // Uses Postgres advisory lock so only ONE replica runs it even in a
   // scaled deployment. The process-local lastDedupDate was meaningless

@@ -4,9 +4,22 @@ import { v4 as uuid } from "uuid";
 import { extractSkillRequest } from "./types";
 import { handleFind } from "./handlers/find";
 import { handleFeedback } from "./handlers/feedback";
+import { handleClaimFeedback } from "./handlers/claim-feedback";
+import { handleNeighbors } from "./handlers/neighbors";
+import { handleProvenance } from "./handlers/provenance";
+import { handleContradictions } from "./handlers/contradictions";
+import { handleIngest } from "./handlers/ingest";
 import { logger } from "../observability/logger";
 
-const SUPPORTED_SKILLS = ["find", "feedback"] as const;
+const SUPPORTED_SKILLS = [
+  "find",
+  "feedback",
+  "claim_feedback",
+  "neighbors",
+  "provenance",
+  "contradictions",
+  "ingest",
+] as const;
 type SupportedSkill = (typeof SUPPORTED_SKILLS)[number];
 
 /**
@@ -65,6 +78,16 @@ function runSkill(
       // handleFeedback already returns Promise<FeedbackResult>, which
       // is assignable to Promise<unknown>. No cast needed.
       return handleFeedback(input);
+    case "claim_feedback":
+      return handleClaimFeedback(input);
+    case "neighbors":
+      return handleNeighbors(input);
+    case "provenance":
+      return handleProvenance(input);
+    case "contradictions":
+      return handleContradictions(input);
+    case "ingest":
+      return handleIngest(input);
   }
 }
 

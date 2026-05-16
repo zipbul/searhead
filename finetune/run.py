@@ -55,6 +55,12 @@ SLEEP_BETWEEN_CHECKS_S = int(os.environ.get("KNOLDR_FT_RECHECK_SECONDS", "3600")
 # format_* function turns into a single SFT example. Caps prevent
 # any one task from dominating the mixture (verdict claims accumulate
 # faster than CoVe ones, etc.).
+#
+# CRITICAL — every query excludes claims whose statement matches an
+# active golden_set_claim row. Golden samples drive the regression
+# gate after training; if they leak into training the gate confirms
+# the model on data it memorized. The exclusion is *by statement
+# text* (not by id) because golden_set lives in its own table.
 SQL = {
     "verdict": """
         SELECT statement, verdict, evidence
@@ -62,6 +68,9 @@ SQL = {
         WHERE verdict IN ('verified', 'disputed')
           AND evidence->>'source' IN ('source_check', 'cove', 'kg_contradiction')
           AND created_at > now() - interval '90 days'
+          AND statement NOT IN (
+            SELECT statement FROM golden_set_claim WHERE active = 1
+          )
         LIMIT 3000
     """,
     "triples": """
@@ -76,6 +85,9 @@ SQL = {
         JOIN entity tgt ON tgt.id = r.target_entity_id
         WHERE c.verdict = 'verified'
           AND c.created_at > now() - interval '90 days'
+          AND c.statement NOT IN (
+            SELECT statement FROM golden_set_claim WHERE active = 1
+          )
         GROUP BY c.id, c.statement
         LIMIT 1500
     """,
@@ -85,6 +97,9 @@ SQL = {
         WHERE evidence->>'source' = 'cove'
           AND verdict IN ('verified', 'disputed')
           AND created_at > now() - interval '90 days'
+          AND statement NOT IN (
+            SELECT statement FROM golden_set_claim WHERE active = 1
+          )
         LIMIT 1500
     """,
     "citation": """
@@ -96,7 +111,30 @@ SQL = {
           AND evidence->'sourceChecks'->0->>'citation' IS NOT NULL
           AND verdict IN ('verified', 'disputed')
           AND created_at > now() - interval '90 days'
+          AND statement NOT IN (
+            SELECT statement FROM golden_set_claim WHERE active = 1
+          )
         LIMIT 1500
+    """,
+    # claim_feedback rows where the reporter provided concrete
+    # failure detail and the evidence is strong enough to trust. The
+    # output teaches the model which dimension of a claim's
+    # truthfulness broke when applied — a signal absent from the
+    # other four tasks (which only see verified/disputed binaries).
+    "feedback": """
+        SELECT c.statement,
+               cf.failure_dimension,
+               cf.counter_claim_text
+        FROM claim_feedback cf
+        JOIN claim c ON c.id = cf.claim_id
+        WHERE cf.outcome IN ('failed', 'partial')
+          AND cf.failure_dimension IS NOT NULL
+          AND cf.evidence_strength >= 0.5
+          AND cf.created_at > now() - interval '90 days'
+          AND c.statement NOT IN (
+            SELECT statement FROM golden_set_claim WHERE active = 1
+          )
+        LIMIT 1000
     """,
 }
 
@@ -160,11 +198,42 @@ def _format_citation(row) -> str | None:
     )
 
 
+# Failure dimensions match the enum in src/db/schema.ts:claim_feedback.
+# Kept here as a literal so the Python container doesn't need to import
+# anything from the TypeScript side.
+FAILURE_DIMENSIONS = (
+    "fully_false",
+    "scope_too_broad",
+    "time_expired",
+    "modality_too_strong",
+    "context_mismatch",
+    "partially_correct",
+)
+
+
+def _format_feedback(row) -> str | None:
+    statement, failure_dimension, counter_claim_text = row
+    if failure_dimension not in FAILURE_DIMENSIONS:
+        return None
+    enum_list = " | ".join(FAILURE_DIMENSIONS)
+    counter_block = (
+        f"\nContext (what an agent observed instead): {counter_claim_text}"
+        if counter_claim_text
+        else ""
+    )
+    return (
+        f"[task: feedback]\nA claim failed when applied. Which dimension of its "
+        f"truth broke? Answer with one label ({enum_list}).\n\n"
+        f"Claim: {statement}{counter_block}\n\n{failure_dimension}"
+    )
+
+
 FORMATTERS = {
     "verdict": _format_verdict,
     "triples": _format_triples,
     "subclaims": _format_subclaims,
     "citation": _format_citation,
+    "feedback": _format_feedback,
 }
 
 
@@ -309,12 +378,310 @@ def _do_train(examples: list[str]) -> int:
     )
     print(f"saved gguf at {gguf_path}")
 
-    os.system(
-        f"curl -s -X POST {OLLAMA_HOST}/api/create "
-        f"-d '{{\"name\":\"knoldr-judge:{version_tag}\",\"modelfile\":\"FROM {gguf_path}\"}}'"
+    # Stage 1: register the candidate under a *staging* tag so we
+    # can probe it without affecting live verify traffic.
+    staging_tag = f"knoldr-judge-staging:{version_tag}"
+    _ollama_create(staging_tag, gguf_path)
+    print(f"registered staging tag {staging_tag}")
+
+    # Stage 2: regression gate. Run prompts from golden_set_claim
+    # through the staging model and measure agreement with the
+    # expected verdicts.
+    eval_result = _run_golden_eval(staging_tag, version_tag)
+    accuracy = eval_result.get("accuracy", 0.0) if eval_result else 0.0
+    threshold = float(os.environ.get("KNOLDR_FT_PROMOTE_MIN_ACCURACY", "0.6"))
+    baseline = _previous_promoted_accuracy()
+
+    # Escape hatch for bootstrap: when there are no golden labels
+    # yet (eval_result is None) AND KNOLDR_FT_PROMOTE_WITHOUT_EVAL=1
+    # is set, promote on faith. The operator owns that risk; default
+    # behavior is to refuse promotion without measurement.
+    force_promote = os.environ.get("KNOLDR_FT_PROMOTE_WITHOUT_EVAL") == "1"
+    parsed = eval_result.get("parsed", 0) if eval_result else 0
+
+    if eval_result is None:
+        eligible = force_promote
+    else:
+        eligible = (
+            parsed > 0
+            and accuracy >= threshold
+            and (baseline is None or accuracy >= baseline - 0.02)  # tiny drift
+        )
+
+    # Stage 3: promote (or not). Persist the run row either way so
+    # the next cycle's baseline reflects reality.
+    _persist_eval(eval_result, version_tag, promoted=eligible)
+
+    if not eligible:
+        reason = (
+            "no golden labels and PROMOTE_WITHOUT_EVAL not set"
+            if eval_result is None
+            else f"accuracy={accuracy:.3f} threshold={threshold:.3f} baseline={baseline} parsed={parsed}"
+        )
+        print(
+            f"NOT PROMOTING ({reason}). "
+            f"Staging tag {staging_tag} retained for inspection."
+        )
+        return 0
+
+    # Promoted: register the history tag and update the latest alias.
+    history_tag = f"knoldr-judge:{version_tag}"
+    _ollama_create(history_tag, gguf_path)
+    _ollama_create("knoldr-judge:latest", gguf_path)
+    print(
+        f"PROMOTED knoldr-judge:latest -> {version_tag} "
+        f"(accuracy={accuracy:.3f}, baseline={baseline})"
     )
-    print(f"registered ollama model knoldr-judge:{version_tag}")
     return 0
+
+
+def _ollama_create(tag: str, gguf_path: Path) -> None:
+    """Register a tag pointing at the given GGUF. Idempotent — the
+    Ollama /api/create endpoint replaces an existing tag with the
+    same name, so this is also how we update `latest`."""
+    payload = json.dumps({"name": tag, "modelfile": f"FROM {gguf_path}"})
+    req = urllib.request.Request(
+        f"{OLLAMA_HOST}/api/create",
+        data=payload.encode(),
+        headers={"content-type": "application/json"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=120).read()
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        print(f"WARN: ollama create {tag} failed: {e}")
+
+
+def _ollama_generate(model: str, prompt: str, timeout_s: int = 60) -> str | None:
+    """One-shot generate. Returns the response text or None on error."""
+    payload = json.dumps({
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        # Verdict prediction needs short answers; capping output tokens
+        # prevents the model from emitting reams of justification text.
+        "options": {"num_predict": 8, "temperature": 0.0},
+    })
+    req = urllib.request.Request(
+        f"{OLLAMA_HOST}/api/generate",
+        data=payload.encode(),
+        headers={"content-type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            data = json.loads(resp.read())
+        return (data.get("response") or "").strip()
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
+        print(f"WARN: ollama generate {model} failed: {e}")
+        return None
+
+
+_VERDICT_PATTERN_VERIFIED = ("verified",)
+_VERDICT_PATTERN_DISPUTED = ("disputed", "refuted", "false")
+
+
+def _parse_verdict_token(resp: str | None) -> str | None:
+    """Strict parse of the verdict-task output. Returns 'verified',
+    'disputed', or None for unparseable / off-vocabulary responses.
+    Unparseable responses are *excluded from the denominator* in
+    the eval — counting them as wrong conflates model failure with
+    output-format failure and warps the regression signal."""
+    if not resp:
+        return None
+    lower = resp.strip().lower()
+    # First non-whitespace token is the most-likely answer; bail on
+    # response that doesn't lead with a recognized verdict token to
+    # avoid matching mid-sentence "verified" inside justifications.
+    first = lower.split(None, 1)[0] if lower.split() else ""
+    first = first.strip(".,!?:;\"'`")
+    if first in _VERDICT_PATTERN_VERIFIED:
+        return "verified"
+    if first in _VERDICT_PATTERN_DISPUTED:
+        return "disputed"
+    # Fall back to a permissive contains check ONLY when the response
+    # is short enough that the token is essentially the whole answer.
+    if len(lower) <= 30:
+        if any(tok in lower for tok in _VERDICT_PATTERN_VERIFIED) and "unverified" not in lower:
+            return "verified"
+        if any(tok in lower for tok in _VERDICT_PATTERN_DISPUTED):
+            return "disputed"
+    return None
+
+
+def _build_eval_source_block(source_urls, source_hint) -> str:
+    """Reconstruct a 'Source:' block that matches the *training*
+    prompt distribution as closely as possible. The training verdict
+    task carries a real citation or URL; the eval should too.
+
+    Preference order:
+      1. First source_urls entry (closest to training format)
+      2. source_hint (labeler memo)
+      3. omit the line entirely so the model isn't forced to
+         hallucinate about a missing source
+    """
+    if source_urls:
+        if isinstance(source_urls, list) and source_urls:
+            first = source_urls[0]
+            if isinstance(first, str) and first:
+                return first
+        elif isinstance(source_urls, str) and source_urls:
+            return source_urls
+    if source_hint:
+        return source_hint
+    return ""
+
+
+def _run_golden_eval(model_tag: str, version_tag: str) -> dict | None:
+    """Run a verdict-only sanity check against the staging model.
+    Pulls active factual golden_set_claim rows with binary expected
+    verdicts and asks the model to classify each. Returns
+    {accuracy, total, correct, parsed, unparseable, byVerdict} or
+    None when there are no samples."""
+    print(f"running golden regression eval against {model_tag}")
+    with psycopg.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT statement, expected_verdict, source_hint, source_urls
+                FROM golden_set_claim
+                WHERE active = 1
+                  AND claim_type = 'factual'
+                  AND expected_verdict IN ('verified', 'disputed')
+            """)
+            rows = cur.fetchall()
+    if not rows:
+        print("golden_set_claim has no factual binary-verdict rows; eval skipped")
+        return None
+
+    correct = 0
+    unparseable = 0
+    by_verdict = {"verified": {"tp": 0, "fp": 0, "fn": 0},
+                  "disputed": {"tp": 0, "fp": 0, "fn": 0}}
+    for statement, expected, source_hint, source_urls in rows:
+        source_block = _build_eval_source_block(source_urls, source_hint)
+        prompt_lines = [f"[task: verdict]", f"Claim: {statement}"]
+        if source_block:
+            prompt_lines.append(f"Source: {source_block}")
+        prompt_lines.append("Answer with one word (verified | disputed).")
+        prompt = "\n".join(prompt_lines)
+
+        resp = _ollama_generate(model_tag, prompt)
+        predicted = _parse_verdict_token(resp)
+        if predicted is None:
+            unparseable += 1
+            continue  # excluded from denominator
+        if predicted == expected:
+            correct += 1
+            by_verdict[predicted]["tp"] += 1
+        else:
+            by_verdict[predicted]["fp"] += 1
+            by_verdict[expected]["fn"] += 1
+
+    parsed = len(rows) - unparseable
+    accuracy = correct / parsed if parsed else 0.0
+    result = {
+        "modelTag": model_tag,
+        "versionTag": version_tag,
+        "total": len(rows),
+        "parsed": parsed,
+        "unparseable": unparseable,
+        "correct": correct,
+        "accuracy": accuracy,
+        "byVerdict": by_verdict,
+    }
+    print(
+        f"golden eval: {correct}/{parsed} = {accuracy:.3f}  "
+        f"(unparseable={unparseable}/{len(rows)})"
+    )
+    return result
+
+
+def _previous_promoted_accuracy() -> float | None:
+    """Look up the accuracy of the most recent successfully-promoted
+    finetune cycle so the new candidate must at least match it (with
+    a small drift allowance). Returns None when no prior promotion
+    exists — first cycle uses the absolute threshold only."""
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT (metrics->>'accuracy')::double precision
+                    FROM golden_set_run
+                    WHERE metrics->>'finetune_promoted' = 'true'
+                    ORDER BY ran_at DESC
+                    LIMIT 1
+                """)
+                row = cur.fetchone()
+        if not row or row[0] is None:
+            return None
+        return float(row[0])
+    except Exception as e:
+        print(f"WARN: previous-baseline lookup failed: {e}")
+        return None
+
+
+def _persist_eval(
+    eval_result: dict | None,
+    version_tag: str,
+    promoted: bool,
+) -> None:
+    """Write the eval outcome into golden_set_run so it's visible to
+    the next cycle (and to Knoldr's regression dashboards).
+
+    Column mapping is deliberate:
+      - total / correct      → over PARSED samples (unparseable excluded)
+      - precision/recall/f1  → all carry the same accuracy figure,
+                               because the staging eval is a single-
+                               class accuracy proxy. Schema CHECK
+                               requires [0,1]; semantic detail lives
+                               in metrics.byVerdict.
+      - metrics              → full diagnostic JSONB (per-verdict tp/
+                               fp/fn, unparseable count, the model
+                               tag, and the promotion flag the next
+                               cycle reads as baseline)
+    """
+    if eval_result is None:
+        return
+    try:
+        accuracy = eval_result.get("accuracy") or 0.0
+        parsed = eval_result.get("parsed") or 0
+        correct = eval_result.get("correct") or 0
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                metrics = {
+                    "accuracy": accuracy,
+                    "byVerdict": eval_result.get("byVerdict"),
+                    "unparseable": eval_result.get("unparseable"),
+                    "totalRows": eval_result.get("total"),
+                    "finetune_promoted": promoted,
+                    "version_tag": version_tag,
+                    "judge_model": eval_result.get("modelTag"),
+                    "metric_semantics": "accuracy_only",
+                }
+                cur.execute(
+                    """
+                    INSERT INTO golden_set_run (
+                        id, ran_at, commit_sha, model_versions, total, correct,
+                        precision_overall, recall_overall, f1_overall, metrics,
+                        baseline_run_id, regressed
+                    ) VALUES (
+                        %s, now(), NULL, %s::jsonb, %s, %s,
+                        %s, %s, %s, %s::jsonb,
+                        NULL, NULL
+                    )
+                    """,
+                    (
+                        f"ft-{version_tag}",
+                        json.dumps({"judge": eval_result.get("modelTag")}),
+                        parsed,
+                        correct,
+                        accuracy,
+                        accuracy,
+                        accuracy,
+                        json.dumps(metrics),
+                    ),
+                )
+                conn.commit()
+    except Exception as e:
+        print(f"WARN: persisting eval row failed: {e}")
 
 
 def main() -> int:

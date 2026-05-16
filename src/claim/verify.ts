@@ -10,6 +10,8 @@ import { decomposeClaim } from "./cove";
 import { webSearch } from "./web-search";
 import { getSpecializedHits } from "./specialized-retrieval";
 import { authorityFor } from "./authority";
+import { recordVerdictTransitionSafe } from "./authority-learn";
+import { writeClaimEdges } from "./relation-writer";
 import { extractClaimYear, isSourceTooOld } from "./time-aware";
 import { getCurrentThresholds } from "./calibration";
 import { aggregate, type SourceEvidence } from "./aggregator";
@@ -61,6 +63,12 @@ export interface VerifyResult {
     kgConflict?: KgContradiction;
     subClaims?: SubClaimResult[];
     votes?: Array<{ cli: string; verdict: Verdict; certainty: number }>;
+    // claim_relation edge targets discovered during verify. The
+    // queue committer writes CONTRADICTS / SUPPORTS rows from
+    // these AFTER the verdict commits, so any FK miss can't roll
+    // back the commit itself.
+    contradictingClaimIds?: string[];
+    corroboratingClaimIds?: string[];
   };
 }
 
@@ -88,6 +96,11 @@ const SOURCE_CHECK_MAX_URLS = 5;
  *      is wired in directly (see DESIGN.md:231 "Pyreez 검증 도구").
  */
 export async function verifyClaim(claimId: string): Promise<VerifyResult | null> {
+  const result = await verifyClaimInner(claimId);
+  return result;
+}
+
+async function verifyClaimInner(claimId: string): Promise<VerifyResult | null> {
   const [row] = await db
     .select({
       statement: claim.statement,
@@ -104,19 +117,51 @@ export async function verifyClaim(claimId: string): Promise<VerifyResult | null>
   const crossRefTimer = verifyStageLatency.startTimer({ stage: "db_cross_ref" });
   const crossRef = await dbCrossRef(claimId, row.entryId, row.embedding);
   crossRefTimer();
+
+  // Post-processing hook: every return below funnels through
+  // `withCrossRef` so cross-ref contradictions land in the eventual
+  // evidence regardless of which stage decided the verdict.
+  //
+  // Cross-ref contradictions are an independent signal from the KG
+  // ones a verdict stage may have already attached — KG fires on
+  // functional-predicate triple conflicts, cross-ref fires on
+  // semantic-embedding neighbors. Both should land as CONTRADICTS
+  // edges, so we *merge + dedupe* rather than skip when the result
+  // already carries some.
+  const MAX_CONTRADICT_EDGES = 8;
+  const withCrossRef = (r: VerifyResult | null): VerifyResult | null => {
+    if (!r) return null;
+    if (crossRef.contradictingIds.length === 0) return r;
+    const existing = r.evidence.contradictingClaimIds ?? [];
+    const merged = Array.from(
+      new Set([...existing, ...crossRef.contradictingIds]),
+    ).slice(0, MAX_CONTRADICT_EDGES);
+    return {
+      ...r,
+      evidence: {
+        ...r.evidence,
+        contradictingClaimIds: merged,
+      },
+    };
+  };
+
   if (
     crossRef.corroborations >= CROSS_REF_MIN_CORROBORATIONS &&
     crossRef.contradictions === 0
   ) {
-    return {
+    return withCrossRef({
       verdict: "verified",
       certainty: 0.6,
       evidence: {
         source: "db_cross_ref",
         corroborations: crossRef.corroborations,
         contradictions: crossRef.contradictions,
+        // Cap to 5 SUPPORTS edges per claim so high-corroboration
+        // claims don't explode the graph; the top-5 by similarity
+        // already came back ordered.
+        corroboratingClaimIds: crossRef.corroboratingIds.slice(0, 5),
       },
-    };
+    });
   }
 
   // KG contradiction check: extract triples from the claim, see if a
@@ -129,11 +174,23 @@ export async function verifyClaim(claimId: string): Promise<VerifyResult | null>
   const kgConflict = await checkKgContradiction(row.statement);
   kgTimer();
   if (kgConflict && kgConflict.confidence >= 0.7) {
-    return {
+    // Flatten every supporting claim id across all conflicting
+    // objects into CONTRADICTS targets. Cap at 10 per claim so a
+    // popular subject doesn't write a hundred edges per detection.
+    const contradictingClaimIds = Array.from(
+      new Set(
+        kgConflict.conflictingObjects.flatMap((co) => co.claimIds),
+      ),
+    ).slice(0, 10);
+    return withCrossRef({
       verdict: "disputed",
       certainty: kgConflict.confidence,
-      evidence: { source: "kg_contradiction", kgConflict },
-    };
+      evidence: {
+        source: "kg_contradiction",
+        kgConflict,
+        contradictingClaimIds,
+      },
+    });
   }
 
   const sources = await db
@@ -165,7 +222,7 @@ export async function verifyClaim(claimId: string): Promise<VerifyResult | null>
       if (sourceCheck.verdict === "verified") {
         const counter = await counterSearch(row.statement);
         if (counter?.triggered) {
-          return {
+          return withCrossRef({
             verdict: "disputed",
             certainty: counter.contradiction,
             evidence: {
@@ -173,10 +230,10 @@ export async function verifyClaim(claimId: string): Promise<VerifyResult | null>
               source: "source_check",
               rationale: `counter-search refuted at ${counter.url} (contradiction=${counter.contradiction.toFixed(2)})`,
             },
-          };
+          });
         }
       }
-      return sourceCheck;
+      return withCrossRef(sourceCheck);
     }
 
     // Source check inconclusive (every chunk neutral or below
@@ -186,7 +243,7 @@ export async function verifyClaim(claimId: string): Promise<VerifyResult | null>
     // that clearly fails — e.g. "Bun runs on V8" splits into "Bun
     // is a JS runtime" (entailed) and "Bun's engine is V8" (refuted).
     const cove = await runCoveVerification(row.statement, sourceUrls);
-    if (cove) return cove;
+    if (cove) return withCrossRef(cove);
   }
 
   // No usable cited sources (or all inconclusive). Pull external
@@ -207,9 +264,9 @@ export async function verifyClaim(claimId: string): Promise<VerifyResult | null>
     .slice(0, 8);
   if (externalUrls.length > 0) {
     const webCheck = await runSourceCheck(row.statement, externalUrls);
-    if (webCheck) return webCheck;
+    if (webCheck) return withCrossRef(webCheck);
     const webCove = await runCoveVerification(row.statement, externalUrls);
-    if (webCove) return webCove;
+    if (webCove) return withCrossRef(webCove);
   }
 
   // No conclusive evidence found anywhere. Return null so caller
@@ -552,14 +609,19 @@ async function dbCrossRef(
   claimId: string,
   entryId: string,
   embedding: number[],
-): Promise<{ corroborations: number; contradictions: number }> {
+): Promise<{
+  corroborations: number;
+  contradictions: number;
+  corroboratingIds: string[];
+  contradictingIds: string[];
+}> {
   const vec = `[${embedding.join(",")}]`;
   // Cosine distance: 0 = identical, 2 = opposite. Convert to similarity.
   // Exclude the claim's OWN entry — other claims extracted from the
   // same source trivially rephrase each other and create a self-
   // reinforcing echo chamber in the cross-ref score.
   const neighbors = await db.execute(sql`
-    SELECT verdict, 1 - (embedding <=> ${vec}::vector) AS similarity
+    SELECT id, verdict, 1 - (embedding <=> ${vec}::vector) AS similarity
     FROM claim
     WHERE id <> ${claimId}
       AND entry_id <> ${entryId}
@@ -571,11 +633,22 @@ async function dbCrossRef(
 
   let corroborations = 0;
   let contradictions = 0;
-  for (const n of neighbors as unknown as Array<{ verdict: string; similarity: number }>) {
-    if (n.verdict === "verified") corroborations++;
-    else if (n.verdict === "disputed") contradictions++;
+  const corroboratingIds: string[] = [];
+  const contradictingIds: string[] = [];
+  for (const n of neighbors as unknown as Array<{
+    id: string;
+    verdict: string;
+    similarity: number;
+  }>) {
+    if (n.verdict === "verified") {
+      corroborations++;
+      corroboratingIds.push(n.id);
+    } else if (n.verdict === "disputed") {
+      contradictions++;
+      contradictingIds.push(n.id);
+    }
   }
-  return { corroborations, contradictions };
+  return { corroborations, contradictions, corroboratingIds, contradictingIds };
 }
 
 
@@ -692,12 +765,27 @@ async function processVerifyQueueInner(batchSize: number): Promise<number> {
           evidence: { source: "exhausted_pipeline", rationale: "all verification paths returned null" },
         };
       }
+      let oldVerdict: string | null = null;
       await db.transaction(async (tx) => {
+        // Capture the pre-update verdict so we can fire the
+        // agent_feedback_authority learner only on actual
+        // transitions. SELECT inside the tx keeps the snapshot
+        // consistent with the UPDATE that follows.
+        const [prior] = await tx
+          .select({ verdict: claim.verdict })
+          .from(claim)
+          .where(eq(claim.id, item.claimId))
+          .limit(1);
+        oldVerdict = prior?.verdict ?? null;
         await tx
           .update(claim)
           .set({
             verdict: result!.verdict,
             certainty: result!.certainty,
+            // Sync authority with the fresh certainty on first
+            // commit. Subsequent feedback-driven adjustments move
+            // authority independently while certainty stays put.
+            authority: result!.certainty,
             evidence: result!.evidence,
           })
           .where(eq(claim.id, item.claimId));
@@ -708,7 +796,7 @@ async function processVerifyQueueInner(batchSize: number): Promise<number> {
             ${item.claimId},
             ${result!.verdict},
             ${result!.certainty},
-            ${(result!.evidence as { source?: string }).source ?? null},
+            ${result!.evidence.source},
             ${process.env.KNOLDR_OLLAMA_FAST_MODEL ?? "gemma4:e4b"},
             'auto',
             NOW()
@@ -717,9 +805,38 @@ async function processVerifyQueueInner(batchSize: number): Promise<number> {
         await tx.delete(verifyQueue).where(eq(verifyQueue.claimId, item.claimId));
       });
       verifyVerdicts.inc({
-        source: (result!.evidence as { source?: string }).source ?? "unknown",
+        source: result!.evidence.source,
         verdict: result!.verdict,
       });
+      // Fire-and-forget authority learning. Failures here can't
+      // touch the verdict commit above (already done), and the
+      // function swallows its own errors.
+      if (oldVerdict && oldVerdict !== result!.verdict) {
+        recordVerdictTransitionSafe(
+          item.claimId,
+          oldVerdict as "verified" | "disputed" | "unverified" | "not_applicable",
+          result!.verdict as "verified" | "disputed" | "unverified" | "not_applicable",
+        );
+      }
+      // claim_relation edge writes — outside the verdict tx so a
+      // failed edge insert (FK miss, dup) can't roll back the
+      // verdict commit. writeClaimEdges is ON CONFLICT DO NOTHING
+      // and FK-safe; failures are logged and swallowed inside.
+      const ev = result!.evidence;
+      if (ev.contradictingClaimIds && ev.contradictingClaimIds.length > 0) {
+        await writeClaimEdges(item.claimId, ev.contradictingClaimIds, "contradicts", {
+          weight: result!.certainty,
+          createdBy: "auto",
+          metadata: { source: ev.source },
+        });
+      }
+      if (ev.corroboratingClaimIds && ev.corroboratingClaimIds.length > 0) {
+        await writeClaimEdges(item.claimId, ev.corroboratingClaimIds, "supports", {
+          weight: result!.certainty,
+          createdBy: "auto",
+          metadata: { source: ev.source },
+        });
+      }
       return { committed: true };
     }),
   );

@@ -10,6 +10,13 @@ export interface KgContradiction {
     objectName: string;
     objectType: string;
     supportingClaims: number;
+    /**
+     * IDs of the verified claims that asserted this conflicting
+     * object. Caller uses these to write CONTRADICTS edges from the
+     * new claim into each. Capped to the top few to bound edge fanout
+     * on subjects with hundreds of corroborations.
+     */
+    claimIds: string[];
   }>;
   /**
    * Heuristic confidence the contradiction is real. Combines:
@@ -78,6 +85,7 @@ export async function checkKgContradiction(
 interface ConflictRow {
   object_name: string;
   object_type: string;
+  claim_ids: string[];
   supporting_claims: number;
 }
 
@@ -88,7 +96,14 @@ interface ConflictRow {
  */
 async function findConflictingObjects(
   t: ExtractedTriple,
-): Promise<Array<{ objectName: string; objectType: string; supportingClaims: number }>> {
+): Promise<
+  Array<{
+    objectName: string;
+    objectType: string;
+    supportingClaims: number;
+    claimIds: string[];
+  }>
+> {
   const subjName = t.subject.name.trim();
   const predicate = normalizePredicate(t.predicate);
   const newObjName = t.object.name.trim().toLowerCase();
@@ -98,11 +113,17 @@ async function findConflictingObjects(
   // calls — same entity might be "tech" once and "other" another
   // time — so requiring type-equality misses real conflicts. Same
   // for the object exclusion: compare object names only.
+  //
+  // We also array_agg the contributing claim ids (capped to 10 per
+  // object) so the verify pipeline can write CONTRADICTS edges from
+  // the new claim into each. The cap bounds edge fanout when a
+  // subject has hundreds of corroborating claims.
   const rows = (await db.execute(sql`
     SELECT
       tgt.name AS object_name,
       tgt.type AS object_type,
-      COUNT(DISTINCT r.claim_id)::int AS supporting_claims
+      COUNT(DISTINCT r.claim_id)::int AS supporting_claims,
+      (array_agg(DISTINCT r.claim_id))[1:10] AS claim_ids
     FROM kg_relation r
     JOIN entity src ON src.id = r.source_entity_id
     JOIN entity tgt ON tgt.id = r.target_entity_id
@@ -119,6 +140,7 @@ async function findConflictingObjects(
   return rows.map((r) => ({
     objectName: r.object_name,
     objectType: r.object_type,
+    claimIds: r.claim_ids ?? [],
     supportingClaims: r.supporting_claims,
   }));
 }

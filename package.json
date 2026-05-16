@@ -22,7 +22,8 @@
     "docker:down": "docker compose down",
     "docker:test": "docker compose --profile test up -d --wait db-test",
     "setup": "docker compose up -d --wait db && bun run db:migrate",
-    "test:db": "docker compose --profile test up -d --wait db-test && TEST_DATABASE_URL=postgres://knoldr:knoldr@localhost:5433/knoldr_test bun test tests/integration/ tests/e2e/"
+    "test:db": "docker compose --profile test up -d --wait db-test && TEST_DATABASE_URL=postgres://knoldr:knoldr@localhost:5433/knoldr_test bun test tests/integration/ tests/e2e/",
+    "eval:golden": "bun run src/eval/cli.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",

@@ -306,6 +306,31 @@ async function migrate() {
   // every contradiction check Seq Scans the full edge table.
   await sql`CREATE INDEX IF NOT EXISTS idx_kg_relation_type ON kg_relation(relation_type)`;
 
+  // ============================================================
+  // claim_relation (v0.4) — typed edges between claims.
+  // Substrate for contradiction surfacing, supports walks,
+  // derives-from provenance, superseded-by (world changed),
+  // and refines (partial-truth correction).
+  // ============================================================
+  await sql`
+    CREATE TABLE IF NOT EXISTS claim_relation (
+      id TEXT PRIMARY KEY,
+      source_claim_id TEXT NOT NULL REFERENCES claim(id) ON DELETE CASCADE,
+      target_claim_id TEXT NOT NULL REFERENCES claim(id) ON DELETE CASCADE,
+      relation_type TEXT NOT NULL
+        CHECK (relation_type IN ('supports','contradicts','derives_from','superseded_by','refines')),
+      weight DOUBLE PRECISION NOT NULL DEFAULT 1.0 CHECK (weight >= 0 AND weight <= 1),
+      created_by TEXT NOT NULL,
+      metadata JSONB,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      CHECK (source_claim_id <> target_claim_id),
+      UNIQUE (source_claim_id, target_claim_id, relation_type)
+    )
+  `;
+  await sql`CREATE INDEX IF NOT EXISTS idx_claim_relation_source ON claim_relation(source_claim_id, relation_type)`;
+  await sql`CREATE INDEX IF NOT EXISTS idx_claim_relation_target ON claim_relation(target_claim_id, relation_type)`;
+  await sql`CREATE INDEX IF NOT EXISTS idx_claim_relation_type ON claim_relation(relation_type)`;
+
   // No human-review queue. The verifier auto-escalates uncertain
   // cases through CoVe + web_search + specialized retrieval and
   // commits whatever the strongest available signal indicates,
@@ -327,6 +352,213 @@ async function migrate() {
     )
   `;
   await sql`INSERT INTO calibration_state (id) VALUES (1) ON CONFLICT (id) DO NOTHING`;
+
+  // ============================================================
+  // claim — verifiability columns (v0.4 prep). Nullable so existing
+  // rows survive; new extraction code will populate them and a later
+  // migration flips NOT NULL once backfill completes.
+  // ============================================================
+  await sql`ALTER TABLE claim ADD COLUMN IF NOT EXISTS source_span TEXT`;
+  await sql`ALTER TABLE claim ADD COLUMN IF NOT EXISTS source_url TEXT`;
+  await sql`ALTER TABLE claim ADD COLUMN IF NOT EXISTS modality TEXT`;
+  await sql`ALTER TABLE claim ADD COLUMN IF NOT EXISTS polarity INTEGER`;
+  await sql`ALTER TABLE claim ADD COLUMN IF NOT EXISTS quantifier TEXT`;
+  await sql`ALTER TABLE claim ADD COLUMN IF NOT EXISTS valid_from TIMESTAMPTZ`;
+  await sql`ALTER TABLE claim ADD COLUMN IF NOT EXISTS valid_until TIMESTAMPTZ`;
+
+  // claim.authority — mutable trust score, separate from certainty.
+  // Initialized from certainty for existing rows; new rows insert
+  // with default 0 (storeClaims overrides to certainty value).
+  await sql`ALTER TABLE claim ADD COLUMN IF NOT EXISTS authority DOUBLE PRECISION NOT NULL DEFAULT 0`;
+  await sql`UPDATE claim SET authority = certainty WHERE authority = 0 AND certainty > 0`;
+  await sql`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'claim_authority_range') THEN
+      ALTER TABLE claim ADD CONSTRAINT claim_authority_range
+        CHECK (authority >= 0 AND authority <= 1);
+    END IF;
+  END $$`;
+
+  // CHECK constraints — applied conditionally so re-runs don't fail
+  // and existing NULL rows pass. We use a guarded DO block per
+  // constraint to stay idempotent.
+  await sql`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'claim_source_span_len') THEN
+      ALTER TABLE claim ADD CONSTRAINT claim_source_span_len
+        CHECK (source_span IS NULL OR length(source_span) <= 4000);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'claim_source_url_len') THEN
+      ALTER TABLE claim ADD CONSTRAINT claim_source_url_len
+        CHECK (source_url IS NULL OR length(source_url) <= 2000);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'claim_modality_values') THEN
+      ALTER TABLE claim ADD CONSTRAINT claim_modality_values
+        CHECK (modality IS NULL OR modality IN ('asserted','hedged','possible','conditional','quoted'));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'claim_polarity_values') THEN
+      ALTER TABLE claim ADD CONSTRAINT claim_polarity_values
+        CHECK (polarity IS NULL OR polarity IN (0, 1));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'claim_quantifier_values') THEN
+      ALTER TABLE claim ADD CONSTRAINT claim_quantifier_values
+        CHECK (quantifier IS NULL OR quantifier IN ('universal','existential','majority','minority','specific','none'));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'claim_valid_range') THEN
+      ALTER TABLE claim ADD CONSTRAINT claim_valid_range
+        CHECK (valid_from IS NULL OR valid_until IS NULL OR valid_from <= valid_until);
+    END IF;
+  END $$`;
+
+  // ============================================================
+  // golden_set_claim — human-labelled regression corpus.
+  // Without this, every pipeline change ships blind. Empty until
+  // labels are added; the eval harness is a no-op on empty corpus.
+  // ============================================================
+  await sql`
+    CREATE TABLE IF NOT EXISTS golden_set_claim (
+      id TEXT PRIMARY KEY,
+      statement TEXT NOT NULL CHECK (length(statement) <= 2000),
+      claim_type TEXT NOT NULL
+        CHECK (claim_type IN ('factual', 'subjective', 'predictive', 'normative')),
+      expected_verdict TEXT NOT NULL
+        CHECK (expected_verdict IN ('verified', 'disputed', 'unverified', 'not_applicable')),
+      domain TEXT,
+      source_hint TEXT,
+      labeled_by TEXT NOT NULL,
+      labeled_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      notes TEXT,
+      active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
+    )
+  `;
+  await sql`CREATE INDEX IF NOT EXISTS idx_golden_set_domain ON golden_set_claim(domain)`;
+  await sql`CREATE INDEX IF NOT EXISTS idx_golden_set_active ON golden_set_claim(active)`;
+  // Source URLs for eval harness to inject into temp entry_source.
+  await sql`ALTER TABLE golden_set_claim ADD COLUMN IF NOT EXISTS source_urls JSONB`;
+
+  // ============================================================
+  // golden_set_run — one row per evaluation pass.
+  // ============================================================
+  await sql`
+    CREATE TABLE IF NOT EXISTS golden_set_run (
+      id TEXT PRIMARY KEY,
+      ran_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      commit_sha TEXT,
+      model_versions JSONB,
+      total INTEGER NOT NULL CHECK (total >= 0),
+      correct INTEGER NOT NULL,
+      precision_overall DOUBLE PRECISION NOT NULL CHECK (precision_overall >= 0 AND precision_overall <= 1),
+      recall_overall DOUBLE PRECISION NOT NULL CHECK (recall_overall >= 0 AND recall_overall <= 1),
+      f1_overall DOUBLE PRECISION NOT NULL CHECK (f1_overall >= 0 AND f1_overall <= 1),
+      metrics JSONB NOT NULL,
+      baseline_run_id TEXT,
+      regressed INTEGER CHECK (regressed IS NULL OR regressed IN (0, 1)),
+      CHECK (correct >= 0 AND correct <= total)
+    )
+  `;
+  await sql`CREATE INDEX IF NOT EXISTS idx_golden_set_run_ran_at ON golden_set_run(ran_at DESC)`;
+
+  // ============================================================
+  // claim_feedback — claim-level structured feedback.
+  // Append-only. Drives claim authority updates via evidence_strength
+  // × agent_feedback_authority. The entry-level feedback_log table is
+  // a separate signal channel and remains untouched.
+  // ============================================================
+  await sql`
+    CREATE TABLE IF NOT EXISTS claim_feedback (
+      id TEXT PRIMARY KEY,
+      claim_id TEXT NOT NULL REFERENCES claim(id) ON DELETE CASCADE,
+      reporter_agent_id TEXT NOT NULL,
+      observed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+      application_method TEXT NOT NULL
+        CHECK (application_method IN ('verified','applied','cited','reasoned_over')),
+      outcome TEXT NOT NULL
+        CHECK (outcome IN ('held','failed','partial')),
+
+      failure_dimension TEXT
+        CHECK (failure_dimension IS NULL OR failure_dimension IN
+          ('fully_false','scope_too_broad','time_expired','modality_too_strong','context_mismatch','partially_correct')),
+      partial_truth DOUBLE PRECISION
+        CHECK (partial_truth IS NULL OR (partial_truth >= 0 AND partial_truth <= 1)),
+      context_domain TEXT,
+      context_time_from TIMESTAMPTZ,
+      context_time_until TIMESTAMPTZ,
+      context_scope JSONB,
+      counter_source_url TEXT
+        CHECK (counter_source_url IS NULL OR length(counter_source_url) <= 2000),
+      counter_claim_text TEXT,
+      counter_nli_score DOUBLE PRECISION
+        CHECK (counter_nli_score IS NULL OR (counter_nli_score >= 0 AND counter_nli_score <= 1)),
+      audit_note TEXT
+        CHECK (audit_note IS NULL OR length(audit_note) <= 4000),
+
+      failure_dimension_inferred TEXT
+        CHECK (failure_dimension_inferred IS NULL OR failure_dimension_inferred IN
+          ('fully_false','scope_too_broad','time_expired','modality_too_strong','context_mismatch','partially_correct')),
+      partial_truth_inferred DOUBLE PRECISION
+        CHECK (partial_truth_inferred IS NULL OR (partial_truth_inferred >= 0 AND partial_truth_inferred <= 1)),
+      counter_source_url_inferred TEXT,
+      enriched_at TIMESTAMPTZ,
+      enriched_by TEXT,
+      enrichment_llm_version TEXT,
+      reporter_responded INTEGER
+        CHECK (reporter_responded IS NULL OR reporter_responded IN (0, 1)),
+      enrichment_status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (enrichment_status IN
+          ('pending','finalized_inferred','awaiting_reporter_push','awaiting_pull',
+           'enriched','expired_reporter_unavailable','skipped_backpressure','not_needed')),
+
+      evidence_strength DOUBLE PRECISION NOT NULL DEFAULT 0.0
+        CHECK (evidence_strength >= 0 AND evidence_strength <= 1),
+
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+      CHECK (context_time_from IS NULL OR context_time_until IS NULL OR context_time_from <= context_time_until)
+    )
+  `;
+  await sql`CREATE INDEX IF NOT EXISTS idx_claim_feedback_claim ON claim_feedback(claim_id, created_at DESC)`;
+  await sql`CREATE INDEX IF NOT EXISTS idx_claim_feedback_reporter ON claim_feedback(reporter_agent_id, created_at DESC)`;
+  await sql`CREATE INDEX IF NOT EXISTS idx_claim_feedback_enrichment_status ON claim_feedback(enrichment_status)`;
+
+  // Push-channel metadata. Older deployments get these as nullable
+  // adds; new deployments see them on the CREATE above (next minor).
+  await sql`ALTER TABLE claim_feedback ADD COLUMN IF NOT EXISTS enrichment_callback_url TEXT`;
+  await sql`ALTER TABLE claim_feedback ADD COLUMN IF NOT EXISTS callback_capability TEXT`;
+  await sql`ALTER TABLE claim_feedback ADD COLUMN IF NOT EXISTS push_attempted_at TIMESTAMPTZ`;
+  await sql`ALTER TABLE claim_feedback ADD COLUMN IF NOT EXISTS push_outcome TEXT`;
+  await sql`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'claim_feedback_callback_capability_values') THEN
+      ALTER TABLE claim_feedback ADD CONSTRAINT claim_feedback_callback_capability_values
+        CHECK (callback_capability IS NULL OR callback_capability IN ('always_on','best_effort','none'));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'claim_feedback_callback_url_len') THEN
+      ALTER TABLE claim_feedback ADD CONSTRAINT claim_feedback_callback_url_len
+        CHECK (enrichment_callback_url IS NULL OR length(enrichment_callback_url) <= 2000);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'claim_feedback_push_outcome_values') THEN
+      ALTER TABLE claim_feedback ADD CONSTRAINT claim_feedback_push_outcome_values
+        CHECK (push_outcome IS NULL OR push_outcome IN ('success','timeout','refused','error','unreachable'));
+    END IF;
+  END $$`;
+
+  // ============================================================
+  // agent_feedback_authority — per-reporter trust score.
+  // Multiplied with claim_feedback.evidence_strength to weight how
+  // much a feedback moves the referenced claim's authority.
+  // ============================================================
+  await sql`
+    CREATE TABLE IF NOT EXISTS agent_feedback_authority (
+      agent_id TEXT PRIMARY KEY,
+      feedback_authority DOUBLE PRECISION NOT NULL DEFAULT 0.5
+        CHECK (feedback_authority >= 0 AND feedback_authority <= 1),
+      total_feedbacks INTEGER NOT NULL DEFAULT 0 CHECK (total_feedbacks >= 0),
+      correct_feedbacks INTEGER NOT NULL DEFAULT 0 CHECK (correct_feedbacks >= 0),
+      incorrect_feedbacks INTEGER NOT NULL DEFAULT 0 CHECK (incorrect_feedbacks >= 0),
+      last_updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      CHECK (correct_feedbacks + incorrect_feedbacks <= total_feedbacks)
+    )
+  `;
+  await sql`CREATE INDEX IF NOT EXISTS idx_agent_feedback_authority ON agent_feedback_authority(feedback_authority DESC)`;
 
   logger.info("migrations complete");
   await sql.end();

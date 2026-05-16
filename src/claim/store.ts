@@ -40,7 +40,21 @@ export async function storeClaims(
         type: c.type,
         verdict,
         certainty: 0,
+        // Authority starts equal to certainty; the verify pipeline
+        // raises certainty on commit (via processVerifyQueueInner's
+        // UPDATE) and that path also bumps authority. From there
+        // claim_feedback moves authority but not certainty.
+        authority: 0,
         embedding,
+        // Verifiability fields — populated whenever the extractor
+        // supplied them. NULL preserved for legacy callers that
+        // bypass the gated extract path.
+        sourceSpan: c.quote ?? null,
+        modality: c.modality ?? null,
+        polarity: c.polarity === undefined ? null : c.polarity ? 1 : 0,
+        quantifier: c.quantifier ?? null,
+        validFrom: c.validFrom ? new Date(c.validFrom) : null,
+        validUntil: c.validUntil ? new Date(c.validUntil) : null,
       });
 
       if (c.type === "factual") {
