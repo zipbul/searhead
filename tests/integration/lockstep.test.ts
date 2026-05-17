@@ -12,6 +12,7 @@
  */
 import { describe, test, expect, afterAll } from 'bun:test';
 import { getTableColumns, getTableName, isTable, type Table } from 'drizzle-orm';
+import { getTableConfig, type PgTable } from 'drizzle-orm/pg-core';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import { migrate as drizzleMigrate } from 'drizzle-orm/postgres-js/migrator';
 import postgres from 'postgres';
@@ -145,6 +146,78 @@ describe('migration lockstep — schema.ts vs drizzle/*.sql', () => {
       const unvalidated = rows.filter(r => !r.convalidated).map(r => r.conname);
       expect(unvalidated).toEqual([]);
       expect(rows.length).toBeGreaterThan(0);
+    } finally {
+      await sql.end();
+    }
+  });
+
+  test.skipIf(!dbAvailable)('every named CHECK declared in schema.ts exists on the migrated DB', async () => {
+    // schema.ts attaches CHECK constraints via the `check()` helper
+    // with explicit names (e.g. `entry_source_trust_range`). Each
+    // one must land in pg_constraint after migrate; a missing name
+    // means the .sql files don't actually create the constraint
+    // even though schema.ts thinks they do.
+    const expectedNames = new Set<string>();
+    for (const value of Object.values(schema)) {
+      if (!isTable(value)) {
+        continue;
+      }
+      // drizzle exposes the resolved table-level CHECKs / FKs /
+      // indexes via `getTableConfig`. The CHECK entries carry the
+      // explicit name passed to `check('name', sql\`...\`)` calls.
+      const cfg = getTableConfig(value as PgTable);
+      for (const c of cfg.checks) {
+        expectedNames.add(c.name);
+      }
+    }
+
+    const sql = postgres(adminUrl(tmpDb), { max: 1 });
+    try {
+      const rows = await sql<{ conname: string }[]>`
+        SELECT conname FROM pg_constraint WHERE contype = 'c'
+      `;
+      const live = new Set(rows.map(r => r.conname));
+      const missing = [...expectedNames].filter(n => !live.has(n));
+      expect(missing).toEqual([]);
+      expect(expectedNames.size).toBeGreaterThan(0);
+    } finally {
+      await sql.end();
+    }
+  });
+
+  test.skipIf(!dbAvailable)('entry table is partitioned by created_at after migrate', async () => {
+    // Without partitioning, every INSERT into entry falls into a
+    // single heap and the year-keyed indexes can't take effect. A
+    // contributor reissuing CREATE TABLE entry in a new .sql
+    // migration without PARTITION BY would silently revert this.
+    const sql = postgres(adminUrl(tmpDb), { max: 1 });
+    try {
+      const rows = await sql<{ partstrat: string; partattrs: string }[]>`
+        SELECT p.partstrat::text, p.partattrs::text
+        FROM pg_partitioned_table p
+        JOIN pg_class c ON c.oid = p.partrelid
+        WHERE c.relname = 'entry'
+      `;
+      expect(rows.length).toBe(1);
+      // 'r' = RANGE in pg_partitioned_table.partstrat.
+      expect(rows[0]!.partstrat).toBe('r');
+    } finally {
+      await sql.end();
+    }
+  });
+
+  test.skipIf(!dbAvailable)('vector and pgroonga extensions are installed after migrate', async () => {
+    // Both extensions are CREATE EXTENSION IF NOT EXISTS in 0000,
+    // but a hand edit that strips them would let downstream tests
+    // pass on a DB that already had them and silently break on
+    // genuinely fresh installs.
+    const sql = postgres(adminUrl(tmpDb), { max: 1 });
+    try {
+      const rows = await sql<{ extname: string }[]>`
+        SELECT extname FROM pg_extension WHERE extname IN ('vector', 'pgroonga')
+      `;
+      const names = rows.map(r => r.extname).sort();
+      expect(names).toEqual(['pgroonga', 'vector']);
     } finally {
       await sql.end();
     }
